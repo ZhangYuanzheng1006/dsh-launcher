@@ -1,0 +1,656 @@
+// Portable "bundled" runtime: a self-contained Node + npm + @deepseek-ai/dsh
+// install under runtimeRoot (~/.dsh-runtime). Target machines need no Node.js,
+// no pnpm, and no harness source checkout.
+
+import { app } from 'electron'
+import { spawn } from 'node:child_process'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { get as httpsGet } from 'node:https'
+import { homedir } from 'node:os'
+import { delimiter, join } from 'node:path'
+import * as yaml from 'js-yaml'
+import { getConfig, setConfig } from './config'
+import { t } from './i18n'
+import { outputOf, runAsync, taskDone, taskLine, taskProgress } from './task'
+import { STANDARD_ALLOW_BUILDS } from './pnpm-compat'
+import { removeDirSafe } from './fs-safe'
+import type { CmdResult } from '../shared/types'
+import { runtimePackageVersion } from './runtime-selection'
+import { githubReleaseSource, parseLauncherRelease } from '../shared/launcher-release'
+import packageInfo from '../../package.json'
+
+// Timeouts for the portable-install steps so a slow or hung child (tar / npm on
+// a slow disk, or a non-C: drive) can never leave the deploy spinner stuck
+// forever — the watchdog only prints "still running", it doesn't abort.
+const EXTRACT_TIMEOUT_MS = 5 * 60_000
+const NPM_TIMEOUT_MS = 20 * 60_000
+
+// npm/pnpm installs inside the deploy must use the same mirror — otherwise a
+// China-based machine crawls on the default registry and the deploy looks hung.
+const REGISTRY = 'https://registry.npmmirror.com'
+
+// --- layout helpers (always resolve from the live config) ---
+
+export function nodeDir(): string {
+  return join(getConfig().runtimeRoot, 'node')
+}
+
+export function nodeExe(): string {
+  return join(nodeDir(), 'node.exe')
+}
+
+export function dshInstallDir(): string {
+  return join(getConfig().runtimeRoot, 'dsh')
+}
+
+export function dshBin(): string {
+  return join(dshInstallDir(), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+}
+
+/**
+ * 给内置 dsh 的安装目录写 pnpm-workspace.yaml(含 allowBuilds 白名单)。
+ *
+ * 为什么必须有:全新机器的一键安装会现装一份**最新版 pnpm**,而 pnpm 12 起只认
+ * pnpm-workspace.yaml 里的 `allowBuilds`,`--config.strictDepBuilds=false` 这类命令行
+ * 绕过**已经失效**(2026-09-18 实测:pnpm 12.4.2 + 该 flag → `ERR_PNPM_IGNORED_BUILDS`;
+ * 同一 flag 在 pnpm 11.21 上有效,所以老机器上复现不出来)。dsh 的核心依赖
+ * (koffi / node-pty / protobufjs / @google/genai / @deepseek-ai/dsh-subprocess-local)
+ * 都要 postinstall,少了白名单这一步,新用户第一次「一键安装运行环境」必失败。
+ * 已存在则合并(保留 pnpm 自己写入的 minimumReleaseAgeExclude 等键)。
+ */
+export function ensureInstallAllowBuilds(dshDir: string): void {
+  const file = join(dshDir, 'pnpm-workspace.yaml')
+  let doc: Record<string, unknown> = {}
+  try {
+    const parsed = existsSync(file) ? (yaml.load(readFileSync(file, 'utf8')) as unknown) : null
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) doc = parsed as Record<string, unknown>
+  } catch {
+    /* 损坏则重写 */
+  }
+  if (!Array.isArray(doc.packages)) doc.packages = ['.']
+  const allow = (doc.allowBuilds && typeof doc.allowBuilds === 'object' && !Array.isArray(doc.allowBuilds))
+    ? (doc.allowBuilds as Record<string, unknown>)
+    : {}
+  let changed = !existsSync(file)
+  for (const name of STANDARD_ALLOW_BUILDS) {
+    if (allow[name] !== true) {
+      allow[name] = true
+      changed = true
+    }
+  }
+  doc.allowBuilds = allow
+  if (!changed) return
+  try {
+    writeFileSync(file, yaml.dump(doc, { noRefs: true, lineWidth: -1 }), 'utf8')
+  } catch {
+    /* 写不了就让 pnpm 按原样走,失败会照常报错 */
+  }
+}
+
+export function resolveBundledNode(): string | null {
+  return existsSync(nodeExe()) ? nodeExe() : null
+}
+
+export function resolveBundledDshBin(): string | null {
+  return existsSync(dshBin()) ? dshBin() : null
+}
+
+export function runtimeInstalled(): boolean {
+  return resolveBundledNode() !== null && resolveBundledDshBin() !== null
+}
+
+/** 运行时缺哪个部分:'node' / 'dsh' / null(完整)。用于报「环境未安装」时给出具体缺项。 */
+export function runtimeMissingPart(): 'node' | 'dsh' | null {
+  if (!resolveBundledNode()) return 'node'
+  if (!resolveBundledDshBin()) return 'dsh'
+  return null
+}
+
+/** 当前内置 @deepseek-ai/dsh 的版本;未安装内置运行环境时返回 null。 */
+export function currentDshVersion(): string | null {
+  // 内置运行时:读 <runtimeRoot>/dsh/node_modules/@deepseek-ai/dsh 的版本。
+  try {
+    const p = join(dshInstallDir(), 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+    if (getConfig().installMode === 'bundled' && existsSync(p)) {
+      const v = (JSON.parse(readFileSync(p, 'utf8')) as { version?: unknown }).version
+      if (typeof v === 'string' && v) return v
+    }
+  } catch { /* 忽略 */ }
+  // 源码模式:读 harness 仓库 CLI 的版本(源码 dsh 的版本)。
+  try {
+    const repo = getConfig().harnessRepo
+    if (repo && getConfig().installMode === 'source') {
+      const p = [join(repo, 'apps', 'cli', 'package.json'), join(repo, 'package.json')].find(file => existsSync(file))
+      if (p) {
+        const v = (JSON.parse(readFileSync(p, 'utf8')) as { version?: unknown }).version
+        if (typeof v === 'string' && v) return v
+      }
+    }
+  } catch { /* 忽略 */ }
+  return null
+}
+
+/**
+ * 查询 registry 上 @deepseek-ai/dsh 的最高版本。之前只查 `latest` dist-tag,
+ * 新版本若发布为预发布(alpha/next/beta 等 tag,如 0.1.2-alpha.3)就检测不到 →
+ * 「dsh 有更新但软件没发现」。改为拉取包元数据(corgi)的 dist-tags,取所有 tag 里
+ * 语义版本最高的。网络失败返回 null(不抛错)。
+ */
+export function latestDshVersion(timeoutMs = 8000): Promise<string | null> {
+  return new Promise((resolve) => {
+    const req = httpsGet(`${REGISTRY}/@deepseek-ai/dsh`, {
+      timeout: timeoutMs,
+      headers: { Accept: 'application/vnd.npm.install-v1+json' }
+    }, (res) => {
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (c) => { body += c })
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body) as { 'dist-tags'?: Record<string, unknown> }
+          const tags = data['dist-tags'] ?? {}
+          const versions = Object.values(tags).filter((v): v is string => typeof v === 'string' && v.length > 0)
+          const best = versions.slice().sort((a, b) => compareSemver(b, a))[0]
+          resolve(best ?? null)
+        } catch {
+          resolve(null)
+        }
+      })
+    })
+    req.on('timeout', () => { req.destroy(); resolve(null) })
+    req.on('error', () => resolve(null))
+  })
+}
+
+/** 当前内置 dsh 版本 vs 官方最新版。 */
+export interface DshUpdateCheck {
+  latest: string | null
+  current: string | null
+  update: boolean
+}
+
+/** 对比当前内置 dsh 与官方最新稳定版;仅当两者都存在且不同时视为有更新。 */
+export async function checkDshUpdate(): Promise<DshUpdateCheck> {
+  const latest = await latestDshVersion()
+  const current = currentDshVersion()
+  return { latest, current, update: latest !== null && current !== null && latest !== current }
+}
+
+/** 比较语义化版本 a 与 b:返回正数(a>b) / 0 / 负数(a<b)。 */
+/**
+ * 语义化版本比较(正确支持预发布):先比 major/minor/patch,再比预发布。
+ * 旧实现把 '0.1.2-alpha.3' 拆成 [0,1,NaN,3]→[0,1,0,3],和 '0.1.1-rc.2' 前 3 位
+ * 判成相等 → 永远检测不到预发布更新。这里按 semver 规则:无预发布 > 有预发布;
+ * 预发布段数值 < 字母,数值段比大小,字母段比字典序。
+ */
+export function compareSemver(a: string, b: string): number {
+  const parse = (v: string): { nums: number[]; pre: string } => {
+    const s = v.replace(/^v/, '')
+    const dash = s.indexOf('-')
+    const core = dash >= 0 ? s.slice(0, dash) : s
+    const pre = dash >= 0 ? s.slice(dash + 1) : ''
+    return { nums: core.split('.').map((x) => Number(x) || 0), pre }
+  }
+  const pa = parse(a)
+  const pb = parse(b)
+  const len = Math.max(pa.nums.length, pb.nums.length)
+  for (let i = 0; i < len; i++) {
+    const x = pa.nums[i] ?? 0
+    const y = pb.nums[i] ?? 0
+    if (x !== y) return x - y
+  }
+  if (!pa.pre && !pb.pre) return 0
+  if (!pa.pre) return 1 // 无预发布 > 有预发布
+  if (!pb.pre) return -1
+  const paPre = pa.pre.split('.')
+  const pbPre = pb.pre.split('.')
+  const n = Math.max(paPre.length, pbPre.length)
+  for (let i = 0; i < n; i++) {
+    const x = paPre[i]
+    const y = pbPre[i]
+    if (x === undefined) return -1
+    if (y === undefined) return 1
+    const xn = Number(x)
+    const yn = Number(y)
+    if (Number.isNaN(xn) && Number.isNaN(yn)) {
+      if (x !== y) return x < y ? -1 : 1
+    } else if (Number.isNaN(xn)) {
+      return 1 // 数值段 < 字母段
+    } else if (Number.isNaN(yn)) {
+      return -1
+    } else if (xn !== yn) {
+      return xn - yn
+    }
+  }
+  return 0
+}
+
+/** 启动器(DSH-Launcher)自身最新版 vs 当前版本。 */
+export interface LauncherUpdateCheck {
+  latest: string | null
+  current: string
+  url: string | null
+  update: boolean
+}
+
+/**
+ * 查询 GitHub 上 DSH-Launcher 的最新 Release,与当前运行版本对比。提示式更新:
+ * 网络失败/查不到时静默返回(update=false),不影响使用;UI 只在有新版本时提示
+ * 用户点击下载,不自动安装(免签名、免下载通道问题)。
+ */
+export async function checkLauncherUpdate(timeoutMs = 8000): Promise<LauncherUpdateCheck> {
+  const current = app.getVersion()
+  const source = githubReleaseSource(packageInfo.repository)
+  if (!source) return { current, latest: null, url: null, update: false }
+  const remote = await new Promise<{ tag: string | null; url: string | null }>((resolve) => {
+    const req = httpsGet(
+      source.api,
+      { timeout: timeoutMs, headers: { 'User-Agent': 'DSH-Launcher' } },
+      (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => { body += c })
+        res.on('end', () => {
+          try {
+            resolve(res.statusCode === 200 ? parseLauncherRelease(JSON.parse(body), source.releases) : { tag: null, url: null })
+          } catch {
+            resolve({ tag: null, url: null })
+          }
+        })
+      },
+    )
+    req.on('timeout', () => { req.destroy(); resolve({ tag: null, url: null }) })
+    req.on('error', () => resolve({ tag: null, url: null }))
+  })
+  const latest = remote.tag ? remote.tag.replace(/^v/, '') : null
+  return {
+    latest,
+    current,
+    url: remote.url,
+    update: latest !== null && compareSemver(latest, current) > 0
+  }
+}
+
+/** Compare dotted version strings: returns true when a >= b (missing parts = 0). */
+function nodeVersionAtLeast(a: string, b: string): boolean {
+  const pa = a.replace(/^v/, '').split('.').map(Number)
+  const pb = b.replace(/^v/, '').split('.').map(Number)
+  for (let i = 0; i < 3; i++) {
+    const x = pa[i] ?? 0
+    const y = pb[i] ?? 0
+    if (x !== y) return x > y
+  }
+  return true
+}
+
+/** Version of the installed portable Node, or null if absent/unreadable. */
+function installedNodeVersion(): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (!existsSync(nodeExe())) {
+      resolve(null)
+      return
+    }
+    const p = spawn(nodeExe(), ['-v'], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    let out = ''
+    p.stdout?.on('data', (c: Buffer) => {
+      out += c.toString('utf8')
+    })
+    p.on('error', () => resolve(null))
+    p.on('close', () => resolve(out.trim().replace(/^v/, '') || null))
+  })
+}
+
+/**
+ * Environment patch for bundled-mode children: force DSH_HOME to the configured
+ * dshHome and prepend the portable node dir to PATH so npm/pnpm (spawned by the
+ * bundled dsh for `dsh plugin`) resolve to the bundled copies.
+ */
+export function bundledEnv(): NodeJS.ProcessEnv {
+  const cfg = getConfig()
+  const dir = nodeDir()
+  const oldPath = process.env.PATH ?? ''
+  return {
+    DSH_HOME: cfg.dshHome,
+    PATH: `${dir}${delimiter}${oldPath}`
+  }
+}
+
+// --- download helper (node https, follows redirects, reports progress) ---
+
+export function downloadFile(url: string, dest: string, onProgress: (received: number, total: number | null) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const file = createWriteStream(dest)
+    let req: ReturnType<typeof httpsGet>
+    // Abort if no bytes arrive for a while — a stalled connection should surface
+    // as a clear error instead of hanging the deploy forever.
+    let stalled: ReturnType<typeof setTimeout> | null = null
+    const armStall = (): void => {
+      if (stalled) clearTimeout(stalled)
+      stalled = setTimeout(() => {
+        req.destroy(new Error(t('下载超时(60 秒无数据)— 请检查网络后重试', 'Download timed out (60s with no data) — check your network and retry')))
+      }, 60_000)
+    }
+    const disarmStall = (): void => {
+      if (stalled) clearTimeout(stalled)
+      stalled = null
+    }
+    req = httpsGet(url, (res) => {
+      const status = res.statusCode ?? 0
+      if (status >= 300 && status < 400 && res.headers.location) {
+        disarmStall()
+        file.destroy()
+        res.resume()
+        req.destroy()
+        const next = new URL(res.headers.location, url).toString()
+        downloadFile(next, dest, onProgress).then(resolve, reject)
+        return
+      }
+      if (status !== 200) {
+        disarmStall()
+        file.destroy()
+        res.resume()
+        reject(new Error(`HTTP ${status}`))
+        return
+      }
+      const total = Number(res.headers['content-length'] ?? 0) || null
+      let received = 0
+      res.on('data', (c: Buffer) => {
+        received += c.length
+        armStall()
+        onProgress(received, total)
+      })
+      res.pipe(file)
+      file.on('finish', () => {
+        disarmStall()
+        file.close(() => resolve())
+      })
+    })
+    armStall()
+    req.on('error', (err) => {
+      disarmStall()
+      reject(err)
+    })
+    file.on('error', (err) => {
+      disarmStall()
+      reject(err)
+    })
+  })
+}
+
+/** Progress reporter that emits a task line roughly every 2 MB. */
+export function progressLine(label: string): (received: number, total: number | null) => void {
+  let last = 0
+  return (received, total) => {
+    if (received - last < 2 * 1024 * 1024) return
+    last = received
+    const mb = (received / 1024 / 1024).toFixed(1)
+    const tot = total ? ` / ${(total / 1024 / 1024).toFixed(1)}MB` : ''
+    taskLine(label, t(`[runtime] 下载中 ${mb}MB${tot}…`, `[runtime] Downloading ${mb}MB${tot}…`))
+  }
+}
+
+/**
+ * Extract a zip archive into `destDir`. Windows ships bsdtar (`tar -xf`
+ * handles zip); fall back to PowerShell Expand-Archive. Returns false on
+ * failure — the caller decides whether the expected output is present.
+ */
+export async function extractZip(zipPath: string, destDir: string, label: string): Promise<boolean> {
+  // 必须用非 shell spawn(shell:true 会把参数拼成命令行交给 cmd.exe,含空格的路径
+  // 如 C:\Users\My Name\... 会被拆开导致「无法识别」)。spawn 直接传参数数组,空格安全。
+  const x = await runAsync('tar', ['-xf', zipPath, '-C', destDir], destDir, label, false, undefined, EXTRACT_TIMEOUT_MS)
+  if (x.ok) return true
+  taskLine(label, t('[runtime] tar 解压失败,改用 PowerShell Expand-Archive…', '[runtime] tar extraction failed, falling back to PowerShell Expand-Archive…'), 'stderr')
+  // PowerShell 的非 shell spawn:命令字符串里的单引号由 PowerShell 自身解析,路径含空格也正确。
+  const ps = await runAsync(
+    'powershell',
+    ['-NoProfile', '-Command', `Expand-Archive -Force -LiteralPath '${zipPath}' -DestinationPath '${destDir}'`],
+    destDir,
+    label,
+    false,
+    undefined,
+    EXTRACT_TIMEOUT_MS
+  )
+  return ps.ok
+}
+
+// --- install / update ---
+
+/**
+ * One-click portable environment install:
+ *  1. download + unpack portable Node (npmmirror) into runtimeRoot/node
+ *  2. npm install -g pnpm (needed for `dsh plugin` and for step 3)
+ *  3. pnpm add @deepseek-ai/dsh@<dshVersion> into runtimeRoot/dsh (full built-in bundle closure).
+ *     pnpm is used instead of a bare npm install because npm without a lockfile drifts on
+ *     the pi-ai/typebox transitive pins (the user-visible `Cannot find module typebox` boot
+ *     failure) and tries to compile koffi from source (needs cmake / VS build tools), while
+ *     pnpm resolves the same versions the official repo lockfile pins and pulls the
+ *     @koromix/koffi platform + node-pty prebuilt packages — no compiler needed.
+ *     (--config.strictDepBuilds=false makes pnpm treat un-approved install scripts as a
+ *     warning instead of failing the whole install; those scripts are no-ops here because
+ *     the native deps arrive as prebuilt platform packages.)
+ *  4. auto-configure the launcher to bundled mode
+ */
+export async function installRuntime(): Promise<CmdResult> {
+  const cfg = getConfig()
+  const label = 'runtime:install'
+  // Preserve configured storage roots. Resetting them would strand per-instance
+  // version installs and silently switch the user's data home on redeployment.
+  const defaultRoot = join(homedir(), '.dsh-runtime')
+  const defaultPluginDir = join(homedir(), 'DSH-Plugin')
+  const defaultDshHome = join(homedir(), '.dsh')
+  const defaultHarnessRepo = existsSync(join(homedir(), 'deepseek-harness'))
+    ? join(homedir(), 'deepseek-harness')
+    : (process.env.DSH_REPO ?? join(homedir(), 'deepseek-harness'))
+  const pathPatch: Record<string, string> = {}
+  if (!cfg.runtimeRoot?.trim()) pathPatch.runtimeRoot = defaultRoot
+  if (!cfg.pluginDir?.trim()) pathPatch.pluginDir = defaultPluginDir
+  if (!cfg.dshHome?.trim()) pathPatch.dshHome = defaultDshHome
+  if (!cfg.harnessRepo?.trim()) pathPatch.harnessRepo = defaultHarnessRepo
+  if (Object.keys(pathPatch).length > 0) {
+    setConfig(pathPatch)
+    taskLine(label, t('[runtime] 已补齐缺失的存储路径', '[runtime] Filled missing storage paths'))
+  }
+  const root = pathPatch.runtimeRoot ?? cfg.runtimeRoot
+  // The DSH team's community red line is Node ≥22.19 (below it, node:zlib lacks
+  // zstd and AbortSignal.timeout) — bump old persisted versions up to the minimum
+  // so the bundled dsh can boot (e.g. existing 22.14 installs self-heal on re-deploy).
+  const MIN_NODE = '22.19.0'
+  const ver = nodeVersionAtLeast(cfg.nodeVersion || '', MIN_NODE) ? cfg.nodeVersion : MIN_NODE
+  // dsh 不在安装包里自带,部署时从 registry 拉取。始终实时抓取 npm 最新稳定版:
+  // latest 标签每次由 pnpm 现场解析,不依赖任何固定版本号——固定版本会错过新版。
+  const dshVer = 'latest'
+  const dir = nodeDir()
+  const stage = join(root, '.node-stage')
+  const zip = join(root, `node-v${ver}-win-x64.zip`)
+  const inner = join(stage, `node-v${ver}-win-x64`)
+  const url = `https://registry.npmmirror.com/-/binary/node/v${ver}/node-v${ver}-win-x64.zip`
+  const npmOpts = ['--no-fund', '--no-audit', '--engine-strict=false', `--registry=${REGISTRY}`]
+
+  mkdirSync(root, { recursive: true })
+  taskLine(label, t(`[runtime] 目标目录: ${root}`, `[runtime] Target directory: ${root}`))
+
+  // Ensure the plugin directory exists too, so a fresh install isn't left with
+  // a dangling Settings path (plugins.ts only creates it on first GitHub install).
+  const pluginDir = pathPatch.pluginDir ?? (cfg.pluginDir || join(homedir(), 'DSH-Plugin'))
+  mkdirSync(pluginDir, { recursive: true })
+
+  // 1. portable Node — skip only when the installed version already satisfies
+  //    the target (dsh needs ≥22.17 for node:zlib zstd); otherwise re-download.
+  const installedNode = await installedNodeVersion()
+  if (installedNode && nodeVersionAtLeast(installedNode, ver)) {
+    taskLine(label, t(`[runtime] Node v${installedNode} 已存在,跳过下载`, `[runtime] Node v${installedNode} already present, skipping download`))
+  } else {
+    if (installedNode) {
+      taskLine(label, t(`[runtime] Node v${installedNode} 过旧(dsh 需要 ≥${ver}),重新下载…`, `[runtime] Node v${installedNode} is too old (dsh needs ≥${ver}), re-downloading…`), 'stderr')
+    }
+    taskLine(label, t(`[runtime] 下载 Node v${ver} …`, `[runtime] Downloading Node v${ver} …`))
+    taskProgress(label, 0.02, t('下载 Node(约 30MB)', 'Downloading Node (~30MB)'))
+    const logDownload = progressLine(label)
+    // Throttle the bar to ~1% buckets so per-chunk progress doesn't flood IPC.
+    let lastBucket = -1
+    try {
+      await downloadFile(url, zip, (received, total) => {
+        logDownload(received, total)
+        // Bytes-driven progress for the bar; guess size when no Content-Length.
+        const pct = total ? received / total : Math.min(1, received / (30 * 1024 * 1024))
+        const bucket = Math.floor(pct * 100)
+        if (bucket !== lastBucket) {
+          lastBucket = bucket
+          taskProgress(label, 0.02 + 0.38 * pct, t('下载 Node', 'Downloading Node'))
+        }
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      taskLine(label, t(`[runtime] 下载失败: ${message}`, `[runtime] Download failed: ${message}`), 'stderr')
+      taskDone(label, 1)
+      return { ok: false, code: 1, error: t(`下载 Node 失败: ${message}`, `Failed to download Node: ${message}`) }
+    }
+
+    taskLine(label, t(`[runtime] 解压到 ${dir} …`, `[runtime] Extracting to ${dir} …`))
+    taskProgress(label, 0.42, t('解压 Node', 'Extracting Node'))
+    mkdirSync(stage, { recursive: true })
+    const okExtract = await extractZip(zip, stage, label)
+    // 验证解压出的目录里真有 node.exe(下载被截断时 zip 可能解出残缺目录,之前只查
+    // inner 目录会漏过,导致「部署成功但 node 缺失」→ 运行时误报环境未安装)。
+    if (!okExtract || !existsSync(inner) || !existsSync(join(inner, 'node.exe'))) {
+      taskDone(label, 1)
+      return { ok: false, code: 1, error: t('Node 解压失败(请检查磁盘空间 / 网络)', 'Failed to extract Node (check disk space / network)') }
+    }
+    // 安全删除:旧运行时目录里可能带链接(裸 rmSync 会穿透链接删掉目标内容)。
+    if (existsSync(dir)) await removeDirSafe(dir)
+    renameSync(inner, dir)
+    rmSync(stage, { recursive: true, force: true })
+    rmSync(zip, { force: true })
+    taskLine(label, t(`[runtime] ✔ Node 就绪: ${nodeExe()}`, `[runtime] ✔ Node ready: ${nodeExe()}`))
+  }
+
+  // 2. pnpm for `dsh plugin` and for the dsh install in step 3.
+  const npm = join(dir, 'npm.cmd')
+  const pnpm = join(dir, 'pnpm.cmd')
+  taskProgress(label, 0.45, t('安装 pnpm', 'Installing pnpm'))
+  if (!existsSync(pnpm)) {
+    taskLine(label, t('[runtime] 安装 pnpm(供 dsh 安装与 plugin 使用)…', '[runtime] Installing pnpm (for dsh install & plugin)…'))
+    // 必须带 bundledEnv()(便携 node 目录前置到 PATH):pnpm 包里有 preinstall
+    // `node install.js`,npm 用 `cmd /c` 跑它 —— 在**没装 Node 的机器**(典型新用户)
+    // PATH 里没有 node,脚本直接报「'node' 不是内部或外部命令」→ 整步失败。
+    const p = await runAsync(npm, ['install', '-g', 'pnpm', ...npmOpts], dir, label, process.platform === 'win32', bundledEnv(), NPM_TIMEOUT_MS)
+    if (!p.ok) {
+      taskDone(label, p.code ?? 1)
+      return p
+    }
+  }
+
+  // 3. bundled dsh (full built-in plugin closure lives in its node_modules).
+  //    Installed with pnpm so transitive pins (pi-ai/typebox) match the official
+  //    lockfile and native deps (koffi, node-pty) come as prebuilt platform
+  //    packages — a bare npm install drifts here and needs a compiler for koffi.
+  const dshDir = dshInstallDir()
+  mkdirSync(dshDir, { recursive: true })
+  const pkg = join(dshDir, 'package.json')
+  if (!existsSync(pkg)) {
+    writeFileSync(pkg, JSON.stringify({ name: 'dsh-runtime', private: true, version: '0.0.0' }, null, 2) + '\n', 'utf8')
+  }
+  taskLine(label, t(`[runtime] 安装 @deepseek-ai/dsh@${dshVer}(含全部内置插件)…`, `[runtime] Installing @deepseek-ai/dsh@${dshVer} (with all built-in plugins)…`))
+  taskProgress(label, 0.5, t(`安装 @deepseek-ai/dsh@${dshVer}(体积较大,请稍候)`, `Installing @deepseek-ai/dsh@${dshVer} (large download, please wait)`))
+  // 必须先落白名单:pnpm 12 起只认 pnpm-workspace.yaml 的 allowBuilds,命令行绕过已失效,
+  // 没它这一步会被 ERR_PNPM_IGNORED_BUILDS 拦死。
+  ensureInstallAllowBuilds(dshDir)
+  // 依赖的 postinstall 会裸调 node / npm(原生模块),PATH 里必须有便携 node。
+  const ins = await runAsync(pnpm, ['add', `@deepseek-ai/dsh@${dshVer}`, `--registry=${REGISTRY}`, '--config.strictDepBuilds=false'], dshDir, label, process.platform === 'win32', bundledEnv(), NPM_TIMEOUT_MS)
+  if (!ins.ok) {
+    taskDone(label, ins.code ?? 1)
+    return ins
+  }
+  // 部署后同时验证 node 与 dsh 入口。此前只查 dshBin,node 缺失时部署照样报成功,
+  // 但运行时检测 node 失败 → 「环境已装却提示未安装」。现在缺哪个都明确报错。
+  if (!existsSync(nodeExe())) {
+    taskDone(label, 1)
+    return { ok: false, code: 1, error: t(`安装后未找到 node(${nodeExe()})`, `node.exe not found after install (${nodeExe()})`) }
+  }
+  if (!existsSync(dshBin())) {
+    taskDone(label, 1)
+    return { ok: false, code: 1, error: t('安装后未找到 dsh 入口(lib/bin.js)', 'dsh entry not found after install (lib/bin.js)') }
+  }
+
+  // 4. auto-configure paths so the launcher switches to bundled mode.
+  taskProgress(label, 0.96, t('写入配置', 'Writing config'))
+  const next = setConfig({
+    installMode: 'bundled',
+    runtimeRoot: root,
+    nodeVersion: ver,
+    nodePath: nodeExe(),
+    launchArgs: [dshBin()],
+    dshHome: cfg.dshHome || join(homedir(), '.dsh'),
+    dshVersion: runtimePackageVersion(dshDir) ?? cfg.dshVersion,
+    pnpm: join(dir, 'pnpm.cmd')
+  })
+  taskProgress(label, 1, t('部署完成', 'Deployment complete'))
+  taskLine(label, t('[runtime] ✔ 完成 — 已切换为 bundled 模式', '[runtime] ✔ Done — switched to bundled mode'))
+  taskLine(label, t(`[runtime] 启动命令: ${next.nodePath} ${[...next.launchArgs, next.profile].join(' ')}`, `[runtime] Launch command: ${next.nodePath} ${[...next.launchArgs, next.profile].join(' ')}`))
+  taskDone(label, 0)
+  return { ok: true, code: 0 }
+}
+
+/**
+ * Upgrade only the bundled @deepseek-ai/dsh package inside runtimeRoot.
+ * The install directory is physically separate from ~/.dsh, so third-party
+ * plugins and cordis.patch.yml user entries are untouched.
+ */
+export async function updateRuntime(): Promise<CmdResult> {
+  const cfg = getConfig()
+  const label = 'runtime:update'
+  if (!existsSync(nodeExe())) {
+    taskLine(label, t('[runtime] 尚未安装运行环境,请先「一键安装运行环境」。', '[runtime] Runtime not installed yet — click "Install runtime" first.'), 'stderr')
+    taskDone(label, 1)
+    return { ok: false, code: 1, error: t('运行环境未安装', 'Runtime not installed') }
+  }
+  // 安装检测到的最高版本(跨 dist-tag,含 alpha/next 等预发布),与 latestDshVersion
+  // 保持一致——否则检测提示有新版本,更新却装回 latest tag,永远「有更新」。
+  const dshVer = (await latestDshVersion()) ?? 'latest'
+  const pnpm = join(nodeDir(), 'pnpm.cmd')
+  if (!existsSync(pnpm)) {
+    taskLine(label, t('[runtime] 未找到 pnpm,请先重新「一键安装运行环境」。', '[runtime] pnpm not found — please re-run "Install runtime" first.'), 'stderr')
+    taskDone(label, 1)
+    return { ok: false, code: 1, error: t('运行环境缺少 pnpm,请重新一键安装', 'Runtime is missing pnpm — re-run one-click install') }
+  }
+  taskLine(label, t(`[runtime] 升级 @deepseek-ai/dsh@${dshVer}(不触碰 ~/.dsh 的第三方插件)…`, `[runtime] Upgrading @deepseek-ai/dsh@${dshVer} (third-party plugins in ~/.dsh are untouched)…`))
+  // 带百分比的进度条:pnpm 下载/安装期间定时递增(0.1→0.9),让进度条持续走动;
+  // 完成后 taskDone(0) 会把进度收束到 100%。
+  taskProgress(label, 0.1, t('开始升级…', 'Starting upgrade…'))
+  let progress = 0.1
+  const tick = setInterval(() => {
+    progress = Math.min(0.9, progress + 0.05)
+    taskProgress(label, progress, t(`安装中…(${Math.round(progress * 100)}%)`, `Installing… (${Math.round(progress * 100)}%)`))
+  }, 2500)
+  try {
+    // 同 installRuntime:升级前也要保证白名单在位(pnpm 12 只认 allowBuilds),
+    // 且依赖的 postinstall 要能找到便携 node。
+    ensureInstallAllowBuilds(dshInstallDir())
+    const r = await runAsync(pnpm, ['add', `@deepseek-ai/dsh@${dshVer}`, `--registry=${REGISTRY}`, '--config.strictDepBuilds=false'], dshInstallDir(), label, process.platform === 'win32', bundledEnv(), NPM_TIMEOUT_MS)
+    if (!r.ok) {
+      taskDone(label, r.code ?? 1)
+      // 常见:官方发布新版 dsh 时依赖(如 dsh-native-command)还没同步发布,导致
+      // pnpm NO_MATCHING_VERSION。给出清晰提示,替代晦涩的 pnpm 报错,可稍后重试。
+      if (/NO_MATCHING_VERSION|No matching version/i.test(outputOf(r))) {
+        const friendly = t(
+          `新版 dsh(${dshVer})的某个依赖尚未发布完整(官方发布顺序错位)。请稍后重试,或先保持当前版本。`,
+          `The new dsh (${dshVer}) has a dependency that isn't fully published yet (official release ordering). Retry later, or keep the current version.`
+        )
+        taskLine(label, `[runtime] ${friendly}`, 'stderr')
+        return { ok: false, code: r.code ?? 1, error: friendly }
+      }
+      return r
+    }
+    const actualVersion = runtimePackageVersion(dshInstallDir())
+    if (!actualVersion || !existsSync(dshBin()) || (dshVer !== 'latest' && actualVersion !== dshVer)) {
+      taskDone(label, 1)
+      return { ok: false, code: 1, error: t('更新后的 DSH 版本或入口校验失败。', 'Updated DSH version or entry point failed validation.') }
+    }
+    setConfig({ dshVersion: actualVersion })
+    taskLine(label, t('[runtime] ✔ 内置 dsh 已升级', '[runtime] ✔ Built-in dsh upgraded'))
+    taskDone(label, 0)
+    return { ok: true, code: 0 }
+  } finally {
+    clearInterval(tick)
+  }
+}

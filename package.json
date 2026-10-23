@@ -1,0 +1,136 @@
+﻿{
+    "name":  "dsh-launcher",
+    "version":  "0.0.2",
+    "description":  "Windows desktop hub for DeepSeek Harness, isolated runtimes, web apps and desktop applications",
+    "main":  "./out/main/index.js",
+    "author":  "ZhangYuanzheng1006",
+    "contributors":  [
+                         "MarcoG-h",
+                         "baihejiangnan"
+                     ],
+    "license":  "MIT",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "https://github.com/ZhangYuanzheng1006/dsh-launcher.git"
+                   },
+    "homepage":  "https://github.com/ZhangYuanzheng1006/dsh-launcher",
+    "bugs":  "https://github.com/ZhangYuanzheng1006/dsh-launcher/issues",
+    "private":  true,
+    "packageManager":  "pnpm@11.21.0",
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "electron-vite dev",
+                    "start":  "electron-vite preview",
+                    "build":  "electron-vite build",
+                    "pack:asar":  "node scripts/pack-asar.mjs",
+                    "test":  "vitest run",
+                    "typecheck":  "tsc --noEmit -p tsconfig.json",
+                    "dist":  "electron-vite build \u0026\u0026 electron-builder --win nsis --x64 --publish never \u0026\u0026 node scripts/verify-package.mjs \u0026\u0026 node scripts/release-artifacts.mjs",
+                    "verify:package":  "node scripts/verify-package.mjs"
+                },
+    "build":  {
+                  "appId":  "com.marcog.dsh-launcher",
+                  "productName":  "DSH Launcher",
+                  "artifactName":  "DSH-Launcher-Setup-${version}-${arch}.${ext}",
+                  "copyright":  "Copyright © 2026 ZhangYuanzheng1006 and upstream contributors",
+                  "publish":  null,
+                  "directories":  {
+                                      "output":  "release"
+                                  },
+                  "asarUnpack":  [
+                                     "**/*.node",
+                                     "**/koffi/**",
+                                     "**/@koromix/**"
+                                 ],
+                  "files":  [
+                                "out/**/*",
+                                "LICENSE",
+                                "NOTICE",
+                                "licenses/**/*"
+                            ],
+                  "extraResources":  [
+                                         {
+                                             "from":  "resources",
+                                             "to":  "."
+                                         },
+                                         {
+                                             "from":  "build/icon.ico",
+                                             "to":  "icon.ico"
+                                         },
+                                         {
+                                             "from":  "chrome-extension",
+                                             "to":  "chrome-extension"
+                                         },
+                                         {
+                                             "from":  "docs/installation.md",
+                                             "to":  "INSTALLATION.md"
+                                         },
+                                         {
+                                             "from":  "LICENSE",
+                                             "to":  "LICENSE"
+                                         },
+                                         {
+                                             "from":  "NOTICE",
+                                             "to":  "NOTICE"
+                                         },
+                                         {
+                                             "from":  "licenses",
+                                             "to":  "licenses"
+                                         },
+                                         {
+                                             "from":  "final",
+                                             "to":  "final"
+                                         }
+                                     ],
+                  "win":  {
+                              "target":  [
+                                             "nsis"
+                                         ],
+                              "icon":  "build/icon.ico"
+                          },
+                  "nsis":  {
+                               "guid":  "d1c0ec62-e192-517b-904e-0d6cd286549d",
+                               "include":  "build/installer.nsh",
+                               "oneClick":  false,
+                               "perMachine":  false,
+                               "allowElevation":  false,
+                               "deleteAppDataOnUninstall":  false,
+                               "allowToChangeInstallationDirectory":  true,
+                               "createDesktopShortcut":  true,
+                               "createStartMenuShortcut":  true,
+                               "shortcutName":  "DSH Launcher",
+                               "multiLanguageInstaller":  true,
+                               "installerLanguages":  [
+                                                          "zh_CN",
+                                                          "en_US"
+                                                      ],
+                               "displayLanguageSelector":  true
+                           }
+              },
+    "dependencies":  {
+                         "dompurify":  "^3.4.13",
+                         "js-yaml":  "^4.3.1",
+                         "koffi":  "^3.3.3",
+                         "marked":  "^18.0.9",
+                         "react":  "^19.2.8",
+                         "react-dom":  "^19.2.8",
+                         "ws":  "^8.22.0"
+                     },
+    "devDependencies":  {
+                            "@electron/asar":  "3.4.1",
+                            "@tailwindcss/vite":  "^4.3.3",
+                            "@types/js-yaml":  "^4.0.9",
+                            "@types/node":  "^26.2.0",
+                            "@types/react":  "^19.2.18",
+                            "@types/react-dom":  "^19.2.4",
+                            "@types/ws":  "^8.18.2",
+                            "@vitejs/plugin-react":  "^6.0.5",
+                            "electron":  "^43.4.0",
+                            "electron-builder":  "^26.15.3",
+                            "electron-vite":  "^5.0.0",
+                            "tailwindcss":  "^4.3.3",
+                            "typescript":  "^7.0.2",
+                            "vite":  "^8.2.1",
+                            "vitest":  "^5.0.5"
+                        }
+}

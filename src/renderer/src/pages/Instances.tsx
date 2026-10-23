@@ -1,0 +1,2112 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+
+/** 常见厂商对话网址预设(新建链接卡片时可选),按拼音字母排序。 */
+const WEB_CHAT_PRESETS = [
+  { name: 'Claude', url: 'https://claude.ai', py: 'claude' },
+  { name: 'ChatGPT', url: 'https://chatgpt.com', py: 'chatgpt' },
+  { name: 'DeepSeek', url: 'https://chat.deepseek.com', py: 'deepseek' },
+  { name: '豆包', url: 'https://www.doubao.com', py: 'doubao' },
+  { name: 'Grok', url: 'https://grok.com', py: 'grok' },
+  { name: 'Kimi', url: 'https://kimi.moonshot.cn', py: 'kimi' },
+  { name: '腾讯元宝', url: 'https://yuanbao.tencent.com', py: 'tengxun' },
+  { name: '通义千问', url: 'https://tongyi.aliyun.com', py: 'tongyi' },
+  { name: '文心一言', url: 'https://yiyan.baidu.com', py: 'wenxin' },
+  { name: '智谱清言', url: 'https://chatglm.cn', py: 'zhipu' }
+].sort((a, b) => a.py.localeCompare(b.py))
+import type { JSX } from 'react'
+import { api, type DshInstance, type GuiAppDiscoverySnapshot, type GuiAppPreset, type GuiAppPresetId, type GuiChromeProfileMode, type GuiWindowPolicy, type PluginMatrixResult, type WebChatConfig } from '../lib/api'
+import { useHarness } from '../hooks/useHarness'
+import { useBackdropClose } from '../hooks/useBackdropClose'
+import { useI18n } from '../i18n'
+import { Toggle } from '../components/Toggle'
+import { TaskConsole } from '../components/TaskConsole'
+import { CopyButton } from '../components/CopyButton'
+import { PlayIcon, StopIcon, TrashIcon, PlusIcon, RefreshIcon, WarningIcon, WindowReturnIcon } from '../lib/icons'
+import { RECOMMENDED_BUNDLES, bundleCount, bundleTaskLabel, type RecommendedBundle } from '../../../shared/bundles'
+import { reorderInstanceItems } from '../lib/instance-order'
+import { resolveCurrentGroup, setGroupItemVisible } from '../../../shared/groups'
+import { fallbackColor, normalizeHttpUrl } from '../../../shared/favicon'
+import { DEFAULT_PROFILE_ID } from '../../../shared/profiles'
+import type { Group } from '../../../shared/types'
+import { GlyphTile } from '../components/Glyph'
+import { FormError, InstanceRuntimeSettings, runtimeVersionError } from '../components/InstanceRuntimeSettings'
+import { isDshInstance, normalizeRuntimeVersion } from '../../../shared/runtime-version'
+
+function splitGuiArgs(text: string): string[] {
+  return text.split(/\r?\n/).filter((line) => line.length > 0)
+}
+
+/** Absolute Windows paths need file:/// for an <img> src. */
+function isChromePath(value: string): boolean {
+  return /(?:^|[\\/])chrome\.exe$/i.test(value.trim())
+}
+
+function guiIconSrc(value: string): string {
+  if (/^(data:|https?:|file:)/i.test(value)) return value
+  return 'file:///' + value.replace(/\\/g, '/')
+}
+
+function statusColor(st: string): string {
+  return st === 'running' || st === 'external'
+    ? 'var(--ok)'
+    : st === 'starting' || st === 'stopping'
+      ? 'var(--accent)'
+      : st === 'degraded'
+        ? 'var(--warn)'
+        : st === 'error'
+          ? 'var(--err)'
+          : 'var(--muted)'
+}
+
+/** Shared modal shell: dark overlay, click outside to close. */
+function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: React.ReactNode; wide?: boolean }): JSX.Element {
+  const { t } = useI18n()
+  const backdrop = useBackdropClose(onClose)
+  return (
+    <div
+      className="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-6"
+      style={{ background: 'rgba(0,0,0,0.5)' }}
+      onMouseDown={backdrop.onMouseDown}
+      onClick={backdrop.onClick}
+    >
+      <div
+        className={`panel w-full ${wide ? 'max-w-2xl' : 'max-w-md'} max-h-[85vh] overflow-y-auto p-5 space-y-4`}
+        onMouseDown={backdrop.contentMouseDown}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="min-w-0 truncate text-[16px] font-semibold">{title}</h3>
+          <button className="btn btn-ghost btn-sm !p-1 shrink-0" onClick={onClose} title={t('instances.close')}>
+            ✕
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/** 「问/答」条目。 */
+interface QaItem {
+  q: string
+  a: string
+}
+
+/** Q&A 弹窗:「关于整合包」/「什么是实例?」共用,仿整合包说明的问答形式。 */
+function QaModal({ title, qa, onClose }: { title: string; qa: QaItem[]; onClose: () => void }): JSX.Element {
+  return (
+    <Modal title={title} onClose={onClose}>
+      <div className="space-y-4">
+        {qa.map((item, i) => (
+          <div key={i} className="space-y-1.5">
+            <div className="text-[13px] font-semibold" style={{ color: 'var(--text)' }}>
+              Q{i + 1}. {item.q}
+            </div>
+            <p
+              className="select-text text-[12.5px] leading-relaxed"
+              style={{ color: 'var(--muted)' }}
+              // 支持 [text](url) markdown 链接(主窗口 setWindowOpenHandler 会 openExternal)。
+              dangerouslySetInnerHTML={{
+                __html: item.a.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer" style="color:var(--accent);text-decoration:underline">$1</a>')
+              }}
+            />
+          </div>
+        ))}
+      </div>
+    </Modal>
+  )
+}
+
+/** Settings-form subset for one instance (profile is fixed at creation, not editable here). */
+interface InstanceForm {
+  name: string
+  description: string
+  port: number
+  autoStart: boolean
+  enabled: boolean
+  exe: string
+  argsText: string
+  windowTitle: string
+  guiPresetId: GuiAppPresetId | ''
+  chromeProfileMode: GuiChromeProfileMode
+  runtimeVersion: string | undefined
+  command: string
+  healthPath: string
+  workspace: string
+}
+
+/** Full editor for one instance, opened by clicking its card. Two tabs: settings / enabled plugins. */
+function EditInstanceModal({ inst, onClose }: { inst: DshInstance; onClose: () => void }): JSX.Element {
+  const { t, statusLabel } = useI18n()
+  const { states, instances, activeInstanceId, setActiveInstance, refresh, config } = useHarness()
+  const [form, setForm] = useState<InstanceForm>({
+    name: inst.name,
+    description: inst.description ?? '',
+    port: inst.port,
+    autoStart: inst.autoStart,
+    enabled: inst.enabled !== false,
+    exe: inst.exe ?? '',
+    argsText: (inst.args ?? []).join('\n'),
+    windowTitle: inst.windowTitle ?? '',
+    guiPresetId: inst.guiPresetId ?? '',
+    chromeProfileMode: inst.chromeProfileMode ?? 'isolated',
+    runtimeVersion: inst.runtimeVersion,
+    command: inst.command ?? '',
+    healthPath: inst.healthPath ?? '/',
+    workspace: inst.workspace ?? ''
+  })
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [tab, setTab] = useState<'settings' | 'plugins'>('settings')
+  const [matrix, setMatrix] = useState<PluginMatrixResult | null>(null)
+  const [pluginBusy, setPluginBusy] = useState<string | null>(null)
+  const st = states[inst.id]?.status ?? 'stopped'
+  const isActive = inst.id === activeInstanceId
+  const isGui = inst.kind === 'gui'
+  const isDsh = isDshInstance(inst)
+  const sameHome = (a: string, b: string): boolean => a.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase() === b.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase()
+  const ownHome = !!inst.dshHome && !!config && !sameHome(inst.dshHome, config.dshHome) && !instances.some(other => other.id !== inst.id && isDshInstance(other) && sameHome(other.dshHome ?? config.dshHome, inst.dshHome!))
+  const runtimeLocked = !['stopped', 'error'].includes(st) || !!states[inst.id]?.pid
+  // error 也允许停止:异常报错但实例可能仍在运行,需要能点「停止」清理残留。
+  const canStop = st !== 'stopped'
+  const guiAttached = states[inst.id]?.guiAttached === true
+
+  const set = <K extends keyof InstanceForm>(k: K, v: InstanceForm[K]): void => {
+    setForm((f) => ({ ...f, [k]: v }))
+  }
+
+  const pickExecutable = async (): Promise<void> => {
+    const picked = await api.pickGuiExecutable()
+    if (picked) set('exe', picked)
+  }
+
+  const save = async (): Promise<void> => {
+    setBusy('save')
+    setError(null)
+    try {
+      await api.updateInstance(inst.id, {
+        name: form.name.trim() || inst.name,
+        description: form.description ?? '',
+        autoStart: form.autoStart,
+        enabled: form.enabled !== false,
+        ...(isGui
+          ? {
+              exe: form.exe.trim(),
+              args: splitGuiArgs(form.argsText),
+              windowTitle: form.windowTitle.trim(),
+              guiPresetId: form.guiPresetId || undefined,
+              chromeProfileMode: isChromePath(form.exe) ? form.chromeProfileMode : undefined
+            }
+          : { port: Number(form.port) || 0 }),
+        ...(isDsh ? { runtimeVersion: form.runtimeVersion === undefined ? '' : normalizeRuntimeVersion(form.runtimeVersion) } : {}),
+        ...(inst.kind === 'web' || inst.kind === 'ps' ? {
+          command: form.command.trim(), workspace: form.workspace.trim(),
+          ...(inst.kind === 'web' ? { healthPath: form.healthPath.trim() || '/' } : {})
+        } : {})
+      })
+      await refresh()
+      onClose()
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const toggleStart = async (): Promise<void> => {
+    setBusy('start')
+    setError(null)
+    try {
+      if (canStop) await api.stopInstance(inst.id)
+      else {
+        const result = await api.startInstance(inst.id)
+        if (!result.ok) setError(result.error ?? '启动失败 / Start failed')
+      }
+      await refresh()
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const adoptExisting = async (): Promise<void> => {
+    setBusy('adopt')
+    try {
+      const r = await api.adoptExistingGuiInstance(inst.id)
+      if (!r.ok && r.error) await api.confirm(r.error)
+      await refresh()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const detachEmbed = async (): Promise<void> => {
+    setBusy('detach')
+    try {
+      const r = await api.detachInstanceKeepAlive(inst.id)
+      if (!r.ok && r.error) await api.confirm(r.error)
+      await refresh()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const remove = async (): Promise<void> => {
+    // 用 main 进程 native dialog(非阻塞、不夺焦点),避免 window.confirm 让后续输入失效。
+    if (!(await api.confirm(t('settings.confirmRemoveInstance', { name: inst.name })))) return
+    // Removal is configuration-only; all homes, sessions and runtime files stay on disk.
+    setBusy('remove')
+    try {
+      await api.removeInstance(inst.id)
+      await refresh()
+      onClose()
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  // Enabled-plugins tab: pull the plugin×instance matrix and poll so plugin-set
+  // changes (which restart the harness) converge without manual refresh.
+  const loadMatrix = useCallback(async (): Promise<void> => {
+    try {
+      setMatrix(await api.listPluginMatrix())
+    } catch {
+      /* non-fatal */
+    }
+  }, [])
+
+  useEffect(() => {
+    if (tab !== 'plugins') return
+    void loadMatrix()
+    const id = setInterval(() => void loadMatrix(), 4000)
+    return () => clearInterval(id)
+  }, [tab, loadMatrix])
+
+  const enabledRows = useMemo(() => {
+    const cells = matrix?.cells ?? {}
+    return (matrix?.rows ?? []).filter((r) => cells[r.name]?.[inst.id] === 'enabled')
+  }, [matrix, inst.id])
+
+  const disablePlugin = async (name: string, displayName: string): Promise<void> => {
+    if (!(await api.confirm(t('plugins.disableConfirm', { name: displayName })))) return
+    setPluginBusy(name)
+    try {
+      await api.disablePlugin(inst.id, name)
+      await loadMatrix()
+    } finally {
+      setPluginBusy(null)
+    }
+  }
+
+  const tabs: readonly (readonly ['settings' | 'plugins', string])[] = !isDsh
+    ? [['settings', t('instances.tabSettings')]]
+    : [
+        ['settings', t('instances.tabSettings')],
+        ['plugins', t('instances.tabPlugins')]
+      ]
+
+  return (
+    <Modal title={t('instances.edit')} onClose={onClose} wide>
+      <div className="flex items-center gap-2">
+        <span className="badge shrink-0" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>
+          {isGui ? t('instances.kindGui') : isDsh ? t('instances.kindDsh') : inst.kind?.toUpperCase()}
+        </span>
+      </div>
+      {/* Settings / enabled plugins */}
+      <div className="flex gap-1 border-b" style={{ borderColor: 'var(--border)' }}>
+        {tabs.map(([key, label]) => (
+          <button
+            key={key}
+            className="border-b-2 px-3 pb-2 text-[13px] font-medium transition-colors"
+            style={{
+              color: tab === key ? 'var(--accent)' : 'var(--muted)',
+              borderColor: tab === key ? 'var(--accent)' : 'transparent'
+            }}
+            onClick={() => setTab(key)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'settings' ? (
+        <>
+          <div>
+            <label className="label">{t('settings.instanceName')}</label>
+            <input className="input" value={form.name} onChange={(e) => set('name', e.target.value)} />
+          </div>
+
+          <div>
+            <label className="label">{t('instances.description')}</label>
+            <textarea
+              className="input resize-none"
+              rows={2}
+              value={form.description}
+              placeholder={t('instances.noDescription')}
+              onChange={(e) => set('description', e.target.value)}
+            />
+          </div>
+
+          {isGui && (
+            <>
+              <div>
+                <label className="label">{t('instances.guiExe')}</label>
+                <div className="flex gap-2">
+                  <input
+                    className="input mono min-w-0 flex-1"
+                    value={form.exe}
+                    placeholder={t('instances.guiExePlaceholder')}
+                    onChange={(e) => set('exe', e.target.value)}
+                  />
+                  <button className="btn btn-ghost btn-sm shrink-0" onClick={() => void pickExecutable()}>
+                    {t('instances.guiBrowse')}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label className="label">{t('instances.guiArgs')}</label>
+                <textarea
+                  className="input mono resize-none"
+                  rows={3}
+                  value={form.argsText}
+                  onChange={(e) => set('argsText', e.target.value)}
+                />
+                <p className="mt-1 text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.guiArgsHint')}</p>
+              </div>
+              <div>
+                <label className="label">{t('instances.guiWindowTitle')}</label>
+                <input
+                  className="input"
+                  value={form.windowTitle}
+                  onChange={(e) => set('windowTitle', e.target.value)}
+                />
+                <p className="mt-1 text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.guiWindowTitleHint')}</p>
+              </div>
+              {isChromePath(form.exe) && (
+                <label className="flex items-start gap-2 rounded border p-2 text-[12px] cursor-pointer" style={{ borderColor: 'var(--border)' }}>
+                  <Toggle
+                    checked={form.chromeProfileMode === 'isolated'}
+                    onChange={(v) => set('chromeProfileMode', v ? 'isolated' : 'shared')}
+                  />
+                  <span className="space-y-0.5">
+                    <span className="block font-medium">{t('instances.chromeIsolatedProfile')}</span>
+                    <span className="block text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.chromeProfileHint')}</span>
+                  </span>
+                </label>
+              )}
+            </>
+          )}
+
+          {isDsh && <InstanceRuntimeSettings instanceId={inst.id} value={form.runtimeVersion} onChange={value => set('runtimeVersion', value)} allowFixed={ownHome} disabled={runtimeLocked || busy !== null} />}
+          {(inst.kind === 'web' || inst.kind === 'ps') && <div className="space-y-2">
+            <label className="block text-[12px]">{t('newTab.command')}<textarea className="input mono" rows={3} value={form.command} onChange={event => set('command', event.target.value)} /></label>
+            <label className="block text-[12px]">{t('instances.workspace')}<input className="input mono" value={form.workspace} onChange={event => set('workspace', event.target.value)} /></label>
+            {inst.kind === 'web' && <label className="block text-[12px]">{t('newTab.healthPath')}<input className="input mono" value={form.healthPath} onChange={event => set('healthPath', event.target.value)} /></label>}
+          </div>}
+          {!isGui && inst.kind !== 'ps' && (
+            <div className="max-w-[220px]">
+              <label className="label">{t('settings.instancePort')}</label>
+              <input
+                className="input mono"
+                type="number"
+                min={0}
+                value={form.port}
+                onChange={(e) => set('port', Number(e.target.value) || 0)}
+              />
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <label className="flex items-center justify-between gap-3 text-[13px] cursor-pointer">
+              <span>{t('settings.instanceAutoStart')}</span>
+              <Toggle checked={form.autoStart} onChange={(v) => set('autoStart', v)} />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-[13px] cursor-pointer">
+              <span>{t('instances.show')}</span>
+              <Toggle checked={form.enabled} onChange={(v) => set('enabled', v)} />
+            </label>
+          </div>
+
+          <div className="space-y-1 border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+            <div className="flex items-center gap-2 text-[12.5px]">
+              <span className="badge-dot" style={{ background: statusColor(st) }} />
+              <span style={{ color: 'var(--muted)' }}>{statusLabel(st)}</span>
+              {isActive && (
+                <span className="badge" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>
+                  {t('settings.isActive')}
+                </span>
+              )}
+            </div>
+            {isDsh && (
+              <>
+                <div className="break-all text-[12px]" style={{ color: 'var(--muted)' }}>
+                  {t('instances.workspace')} <span className="mono">{inst.workspace ?? '—'}</span>
+                </div>
+                <div className="flex items-center gap-2 text-[12px]" style={{ color: 'var(--muted)' }}>
+                  <span className="break-all">{t('instances.dshHome')} <span className="mono">{inst.dshHome ?? '—'}</span></span>
+                  {!inst.dshHome && (
+                    <span className="badge shrink-0" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>
+                      {t('instances.homeShared')}
+                    </span>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+            {!isActive && (
+              <button className="btn btn-ghost btn-sm" disabled={busy !== null} onClick={() => void setActiveInstance(inst.id)}>
+                {t('settings.setActive')}
+              </button>
+            )}
+            <button className="btn btn-ghost btn-sm" disabled={busy !== null} onClick={() => void toggleStart()}>
+              {canStop ? <StopIcon /> : <PlayIcon />} {canStop ? t('settings.stopInstance') : t('settings.startInstance')}
+            </button>
+            {isGui && (
+              <button className="btn btn-ghost btn-sm" disabled={busy !== null} onClick={() => void adoptExisting()}>
+                <WindowReturnIcon /> {t('instances.adoptExisting')}
+              </button>
+            )}
+            {isGui && guiAttached && (
+              <button className="btn btn-ghost btn-sm" disabled={busy !== null} onClick={() => void detachEmbed()}>
+                <WindowReturnIcon /> {t('instances.detachKeepAlive')}
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center justify-between gap-2 border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+            <button
+              className="btn btn-danger btn-sm shrink-0"
+              disabled={busy !== null || instances.length <= 1}
+              title={instances.length <= 1 ? t('settings.cantDeleteLast') : undefined}
+              onClick={() => void remove()}
+            >
+              <TrashIcon /> {t('settings.deleteInstance')}
+            </button>
+            <div className="flex justify-end gap-2">
+              <button className="btn btn-ghost btn-sm" onClick={onClose}>
+                {t('instances.close')}
+              </button>
+              <button className="btn btn-primary btn-sm" disabled={busy !== null || (isGui && !form.exe.trim()) || (isDsh && !!runtimeVersionError(form.runtimeVersion))} onClick={() => void save()}>
+                {t('instances.save')}
+              </button>
+            </div>
+          </div>
+          <FormError message={error} />
+        </>
+      ) : (
+        <>
+          {enabledRows.length === 0 ? (
+            <div className="py-6 text-center text-[13px]" style={{ color: 'var(--muted)' }}>
+              {t('instances.noPluginsEnabled')}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {enabledRows.map((row) => (
+                <div key={row.name} className="flex items-center gap-3 rounded border p-3" style={{ borderColor: 'var(--border)' }}>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-[13px] font-semibold" style={{ color: 'var(--text)' }}>
+                        {row.displayName}
+                      </span>
+                      {row.version && (
+                        <span className="badge shrink-0" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>
+                          v{row.version}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 line-clamp-1 break-words text-[12px]" style={{ color: 'var(--muted)' }}>
+                      {row.remark || row.description || row.name}
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-ghost btn-sm shrink-0"
+                    disabled={pluginBusy !== null}
+                    onClick={() => void disablePlugin(row.name, row.displayName)}
+                  >
+                    {t('plugins.matrix.disable')}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="pt-1 text-[11px]" style={{ color: 'var(--muted)' }}>
+            {t('instances.pluginsHint')}
+          </p>
+        </>
+      )}
+    </Modal>
+  )
+}
+
+/**
+ * 数据目录 (DSH_HOME) 选择:共享(可指定目标 home,选项悬停显示该目录下的实例与地址)
+ * 或独立(全新目录)。新建实例表单与整合包下载弹窗共用。
+ */
+function HomeModePicker({
+  value,
+  onChange
+}: {
+  value: { homeMode: 'shared' | 'isolated'; home: string }
+  onChange: (v: { homeMode: 'shared' | 'isolated'; home: string }) => void
+}): JSX.Element {
+  const { t, lang } = useI18n()
+  const { config, instances } = useHarness()
+  // 自定义共享目标下拉:原生 <option> 不支持悬停详情,用手绘面板
+  const [homeOpen, setHomeOpen] = useState(false)
+  const [hoverHome, setHoverHome] = useState<number | null>(null)
+  const homeRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!homeOpen) return
+    const h = (e: MouseEvent): void => {
+      if (homeRef.current && !homeRef.current.contains(e.target as Node)) setHomeOpen(false)
+    }
+    document.addEventListener('mousedown', h)
+    return () => document.removeEventListener('mousedown', h)
+  }, [homeOpen])
+
+  // 共享目标候选:全局 home + 各实例的独立 home(去重),标注该 home 下有哪些实例。
+  const shareTargets = useMemo(() => {
+    const homes = new Map<string, string[]>()
+    const cfgHome = config?.dshHome
+    if (cfgHome) homes.set(cfgHome, [t('settings.homeSharedDefault')])
+    for (const i of instances) {
+      const h = i.dshHome ?? cfgHome
+      if (!h) continue
+      if (!homes.has(h)) homes.set(h, [])
+      homes.get(h)!.push(i.name)
+    }
+    return [...homes.entries()]
+  }, [instances, config?.dshHome, t])
+
+  return (
+    <div className="space-y-2">
+      {(
+        [
+          ['shared', t('settings.homeModeShared'), t('settings.homeModeSharedHint')],
+          ['isolated', t('settings.homeModeIsolated'), t('settings.homeModeIsolatedHint')]
+        ] as const
+      ).map(([mode, label, hint]) => (
+        <label key={mode} className="flex cursor-pointer items-start gap-2 text-[13px]">
+          <input
+            type="radio"
+            name="homeMode"
+            className="mt-0.5"
+            checked={value.homeMode === mode}
+            onChange={() => onChange({ ...value, homeMode: mode })}
+          />
+          <span className="min-w-0 flex-1 space-y-0.5">
+            <span className="flex items-center gap-2">
+              <span className="font-medium shrink-0" style={{ color: 'var(--text)' }}>{label}</span>
+              {mode === 'shared' && value.homeMode === 'shared' && (
+                <div ref={homeRef} className="relative ml-auto shrink-0">
+                  <button
+                    type="button"
+                    className="input flex h-8 w-auto min-w-[90px] max-w-[110px] items-center justify-between gap-1 rounded-lg border px-2 py-1 text-[12px] font-medium"
+                    title={
+                      (() => {
+                        const cur = shareTargets.find(([h]) => h === value.home)
+                        return cur ? `${cur[1].join(lang === 'zh' ? '、' : ', ')} · ${value.home}` : value.home
+                      })()
+                    }
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setHomeOpen((o) => !o)
+                    }}
+                  >
+                    <span className="truncate">
+                      Home {(shareTargets.findIndex(([h]) => h === value.home) + 1) || 1}
+                    </span>
+                    <span className="text-[9px] opacity-60">▾</span>
+                  </button>
+                  {homeOpen && (
+                    <div
+                      className="absolute right-0 top-full z-20 mt-1 w-[300px] space-y-0.5 rounded-lg border p-1.5 shadow-lg"
+                      style={{ background: 'var(--bg)', borderColor: 'var(--border)' }}
+                    >
+                      {shareTargets.map(([home, names], idx) => (
+                        <div
+                          key={home}
+                          className="cursor-pointer rounded-md px-2 py-1.5 text-[12px]"
+                          style={hoverHome === idx ? { background: 'var(--accent-soft)' } : undefined}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onChange({ ...value, home })
+                            setHomeOpen(false)
+                          }}
+                          onMouseEnter={() => setHoverHome(idx)}
+                        >
+                          <span className="font-medium">Home {idx + 1}</span>
+                          {hoverHome === idx && (
+                            <span
+                              className="mt-0.5 block break-all text-[10.5px] leading-relaxed"
+                              style={{ color: 'var(--muted)' }}
+                            >
+                              {names.join(lang === 'zh' ? '、' : ', ')} · {home}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </span>
+            <span className="block text-[11px] leading-relaxed" style={{ color: 'var(--muted)' }}>{hint}</span>
+          </span>
+        </label>
+      ))}
+    </div>
+  )
+}
+
+/** New-instance form as a modal (name + note + profile/port + auto-start + optional session import). */
+function NewInstanceModal({ onClose }: { onClose: () => void }): JSX.Element {
+  const { t } = useI18n()
+  const { config, instances, activeInstanceId, refresh } = useHarness()
+  const [kind, setKind] = useState<'dsh' | 'gui'>('dsh')
+  const [form, setForm] = useState({
+    name: '',
+    description: '',
+    profile: '',
+    port: 0,
+    autoStart: false,
+    homeMode: 'shared' as 'shared' | 'isolated',
+    home: '',
+    exe: '',
+    argsText: '',
+    windowTitle: '',
+    windowPolicy: '' as GuiWindowPolicy | '',
+    windowClass: '',
+    guiPresetId: '' as GuiAppPresetId | '',
+    chromeProfileMode: 'isolated' as GuiChromeProfileMode,
+    runtimeVersion: undefined as string | undefined,
+    icon: ''
+  })
+  const [discovery, setDiscovery] = useState<GuiAppDiscoverySnapshot>({
+    presets: [],
+    cached: false,
+    refreshing: true,
+    timedOut: false,
+    error: null,
+    updatedAt: null,
+    timings: {}
+  })
+  const [presetNote, setPresetNote] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // 默认共享到全局 home(现状行为);config 到达后补一次初值。
+  useEffect(() => {
+    if (config?.dshHome) setForm((f) => ({ ...f, home: f.home || config.dshHome! }))
+  }, [config?.dshHome])
+  const profileDefaulted = useRef(false)
+  useEffect(() => {
+    if (profileDefaulted.current || !activeInstanceId) return
+    const act = instances.find((i) => i.id === activeInstanceId)
+    if (act) {
+      profileDefaulted.current = true
+      setForm((f) => ({ ...f, profile: act.kind === 'gui' ? 'web' : act.profile }))
+    }
+  }, [instances, activeInstanceId])
+
+  useEffect(() => {
+    if (kind !== 'gui') return
+    let alive = true
+    setDiscovery((prev) => ({ ...prev, refreshing: true, error: null }))
+    const off = api.onEvent((event) => {
+      if (alive && event.type === 'gui-discovery') setDiscovery(event.snapshot)
+    })
+    void api.discoverGuiApps()
+      .then((found) => {
+        if (!alive) return
+        setDiscovery((prev) => ((found.updatedAt ?? 0) >= (prev.updatedAt ?? 0) ? found : prev))
+      })
+      .catch((error: unknown) => {
+        if (!alive) return
+        setDiscovery((prev) => ({
+          ...prev,
+          refreshing: false,
+          error: error instanceof Error ? error.message : String(error)
+        }))
+      })
+    return () => {
+      alive = false
+      off()
+    }
+  }, [kind])
+
+  const refreshDiscovery = async (): Promise<void> => {
+    setDiscovery((prev) => ({ ...prev, refreshing: true, error: null, timedOut: false }))
+    try {
+      const next = await api.refreshGuiAppsDiscovery()
+      setDiscovery(next)
+    } catch (error) {
+      setDiscovery((prev) => ({
+        ...prev,
+        refreshing: false,
+        error: error instanceof Error ? error.message : String(error)
+      }))
+    }
+  }
+
+  const pickExecutable = async (): Promise<void> => {
+    const picked = await api.pickGuiExecutable()
+    if (picked) setForm((f) => ({ ...f, exe: picked, icon: '' }))
+  }
+
+  const applyPreset = (preset: GuiAppPreset): void => {
+    setForm((f) => ({
+      ...f,
+      name: preset.name,
+      exe: preset.exe,
+      argsText: preset.args.join('\n'),
+      windowTitle: preset.windowTitle ?? '',
+      windowPolicy: preset.windowPolicy,
+      windowClass: preset.windowClass ?? '',
+      guiPresetId: preset.id,
+      chromeProfileMode: preset.chromeProfileMode ?? (preset.id === 'chrome' ? 'isolated' : 'shared'),
+      icon: preset.icon ?? ''
+    }))
+    setPresetNote(preset.note ?? '')
+  }
+
+  const create = async (): Promise<void> => {
+    if (!form.name.trim()) return
+    if (kind === 'gui' && !form.exe.trim()) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.addInstance(
+        kind === 'gui'
+          ? {
+              kind: 'gui',
+              name: form.name.trim(),
+              description: form.description.trim(),
+              autoStart: form.autoStart,
+              exe: form.exe.trim(),
+              args: splitGuiArgs(form.argsText),
+              windowTitle: form.windowTitle.trim() || undefined,
+              windowPolicy: form.windowPolicy || undefined,
+              windowClass: form.windowClass.trim() || undefined,
+              guiPresetId: form.guiPresetId || undefined,
+              chromeProfileMode: isChromePath(form.exe) ? form.chromeProfileMode : undefined,
+              icon: form.icon || undefined
+            }
+          : {
+              kind: 'dsh',
+              name: form.name.trim(),
+              description: form.description.trim(),
+              profile: form.profile.trim() || 'web',
+              port: Number(form.port) || 0,
+              autoStart: form.autoStart,
+              homeMode: form.homeMode,
+              runtimeVersion: normalizeRuntimeVersion(form.runtimeVersion),
+              home: form.homeMode === 'shared' ? form.home : undefined
+            }
+      )
+      await refresh()
+      onClose()
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal title={t('settings.addInstance')} onClose={onClose}>
+      <div>
+        <label className="label">{t('instances.instanceType')}</label>
+        <div className="grid grid-cols-2 gap-2">
+          {(['dsh', 'gui'] as const).map((value) => (
+            <button
+              key={value}
+              type="button"
+              className={`btn btn-sm ${kind === value ? 'btn-primary' : 'btn-ghost'}`}
+              onClick={() => setKind(value)}
+            >
+              {t(value === 'gui' ? 'instances.kindGui' : 'instances.kindDsh')}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <label className="label">{t('settings.instanceName')}</label>
+        <input className="input" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} />
+      </div>
+      <div>
+        <label className="label">{t('instances.description')}</label>
+        <textarea
+          className="input resize-none"
+          rows={2}
+          value={form.description}
+          placeholder={t('instances.noDescription')}
+          onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
+        />
+      </div>
+
+      {kind === 'gui' ? (
+        <>
+          <div className="space-y-1.5">
+            <label className="label">{t('instances.guiPresets')}</label>
+            {discovery.presets.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {discovery.presets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    title={[preset.exe, preset.note].filter(Boolean).join('\n')}
+                    onClick={() => applyPreset(preset)}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      {preset.icon && <img src={guiIconSrc(preset.icon)} alt="" className="h-4 w-4 rounded" style={{ objectFit: 'contain' }} />}
+                      {preset.name}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : discovery.refreshing ? (
+              <div className="space-y-2">
+                <div className="flex animate-pulse flex-wrap gap-2">
+                  {[0, 1, 2].map((i) => (
+                    <div
+                      key={i}
+                      className="h-7 rounded-md"
+                      style={{ width: i === 1 ? '6.5rem' : '5.5rem', background: 'var(--bg-soft)' }}
+                    />
+                  ))}
+                </div>
+                <p className="text-[11.5px]" style={{ color: 'var(--muted)' }}>{t('instances.guiDiscovering')}</p>
+              </div>
+            ) : (
+              <p className="text-[11.5px]" style={{ color: 'var(--muted)' }}>{t('instances.guiPresetNone')}</p>
+            )}
+            {discovery.refreshing && discovery.presets.length > 0 && (
+              <p className="text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.guiRefreshing')}</p>
+            )}
+            {discovery.timedOut && !discovery.refreshing && (
+              <p className="text-[11px]" style={{ color: 'var(--warn)' }}>{t('instances.guiDiscoverTimeout')}</p>
+            )}
+            {discovery.error && !discovery.refreshing && (
+              <p className="text-[11px] break-all" style={{ color: 'var(--err)' }}>
+                {t('instances.guiDiscoverFailed', { error: discovery.error })}
+              </p>
+            )}
+            {!discovery.refreshing && (discovery.presets.length === 0 || discovery.timedOut || Boolean(discovery.error)) && (
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => void refreshDiscovery()}>
+                {t('instances.guiRediscover')}
+              </button>
+            )}
+            {presetNote && <p className="text-[11px] leading-relaxed" style={{ color: 'var(--warn)' }}>{presetNote}</p>}
+          </div>
+          <div>
+            <label className="label">{t('instances.guiExe')}</label>
+            <div className="flex gap-2">
+              <input
+                className="input mono min-w-0 flex-1"
+                value={form.exe}
+                placeholder={t('instances.guiExePlaceholder')}
+                onChange={(e) => setForm((f) => ({ ...f, exe: e.target.value }))}
+              />
+              <button type="button" className="btn btn-ghost btn-sm shrink-0" onClick={() => void pickExecutable()}>
+                {t('instances.guiBrowse')}
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="label">{t('instances.guiArgs')}</label>
+            <textarea
+              className="input mono resize-none"
+              rows={3}
+              value={form.argsText}
+              onChange={(e) => setForm((f) => ({ ...f, argsText: e.target.value }))}
+            />
+            <p className="mt-1 text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.guiArgsHint')}</p>
+          </div>
+          <div>
+            <label className="label">{t('instances.guiWindowTitle')}</label>
+            <input
+              className="input"
+              value={form.windowTitle}
+              onChange={(e) => setForm((f) => ({ ...f, windowTitle: e.target.value }))}
+            />
+            <p className="mt-1 text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.guiWindowTitleHint')}</p>
+          </div>
+          {isChromePath(form.exe) && (
+            <label className="flex items-start gap-2 rounded border p-2 text-[12px] cursor-pointer" style={{ borderColor: 'var(--border)' }}>
+              <Toggle
+                checked={form.chromeProfileMode === 'isolated'}
+                onChange={(v) => setForm((f) => ({ ...f, chromeProfileMode: v ? 'isolated' : 'shared' }))}
+              />
+              <span className="space-y-0.5">
+                <span className="block font-medium">{t('instances.chromeIsolatedProfile')}</span>
+                <span className="block text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.chromeProfileHint')}</span>
+              </span>
+            </label>
+          )}
+          <p className="text-[11px] leading-relaxed" style={{ color: 'var(--muted)' }}>{t('instances.guiHint')}</p>
+        </>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label">{t('settings.instanceProfileBase')}</label>
+              <input className="input mono" value={form.profile} readOnly title={t('settings.instanceProfileAuto')} />
+            </div>
+            <div>
+              <label className="label">{t('settings.instancePort')}</label>
+              <input
+                className="input mono"
+                type="number"
+                min={0}
+                value={form.port}
+                onChange={(e) => setForm((f) => ({ ...f, port: Number(e.target.value) || 0 }))}
+              />
+            </div>
+          </div>
+          <p className="text-[11px]" style={{ color: 'var(--muted)' }}>
+            {t('settings.instanceProfileAuto')}
+          </p>
+        </>
+      )}
+
+      <label className="flex items-center gap-2 text-[13px] cursor-pointer">
+        <Toggle checked={form.autoStart} onChange={(v) => setForm((f) => ({ ...f, autoStart: v }))} />
+        {t('settings.instanceAutoStart')}
+      </label>
+
+      {kind === 'dsh' && (
+        <div className="space-y-2 border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+          <InstanceRuntimeSettings value={form.runtimeVersion} onChange={version => setForm(current => ({ ...current, runtimeVersion: version, homeMode: version !== undefined ? 'isolated' : current.homeMode }))} disabled={busy} />
+          <label className="label">{t('settings.homeModeLabel')}</label>
+          {form.runtimeVersion !== undefined ? <p className="text-[12px]" style={{ color: 'var(--muted)' }}>{t('settings.homeModeIsolated')} · {t('settings.homeModeIsolatedHint')}</p> : <HomeModePicker
+            value={{ homeMode: form.homeMode, home: form.home }}
+            onChange={(v) => setForm((f) => ({ ...f, homeMode: v.homeMode, home: v.home }))}
+          />}
+        </div>
+      )}
+      <FormError message={error} />
+      <div className="flex justify-end gap-2 border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+        <button className="btn btn-ghost btn-sm" onClick={onClose}>
+          {t('instances.close')}
+        </button>
+        <button
+          className="btn btn-primary btn-sm"
+          disabled={busy || !form.name.trim() || (kind === 'gui' && !form.exe.trim()) || (kind === 'dsh' && !!runtimeVersionError(form.runtimeVersion))}
+          onClick={() => void create()}
+        >
+          {t('settings.instanceAddBtn')}
+        </button>
+      </div>
+    </Modal>
+  )
+}
+/** 整合包下载前的数据目录确认:新实例的 home 模式(共享到哪个目录 / 全新独立目录)。 */
+function BundleHomeModal({
+  bundle,
+  onClose,
+  onDownload
+}: {
+  bundle: RecommendedBundle
+  onClose: () => void
+  onDownload: (opts: { homeMode: 'shared' | 'isolated'; home?: string }) => void
+}): JSX.Element {
+  const { t } = useI18n()
+  const { config } = useHarness()
+  const [homeMode, setHomeMode] = useState<'shared' | 'isolated'>('shared')
+  const [home, setHome] = useState('')
+  // 默认共享到全局 home;config 到达后补一次初值。
+  useEffect(() => {
+    if (config?.dshHome) setHome((h) => h || config.dshHome!)
+  }, [config?.dshHome])
+
+  return (
+    <Modal title={t('instances.bundleHomeTitle')} onClose={onClose}>
+      <p className="mb-3 text-[12px] leading-relaxed" style={{ color: 'var(--muted)' }}>
+        {t('instances.bundleHomeHint', { name: bundle.name })}
+      </p>
+      <HomeModePicker
+        value={{ homeMode, home }}
+        onChange={(v) => {
+          setHomeMode(v.homeMode)
+          setHome(v.home)
+        }}
+      />
+      <div className="flex justify-end gap-2 border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+        <button className="btn btn-ghost btn-sm" onClick={onClose}>
+          {t('instances.close')}
+        </button>
+        <button className="btn btn-primary btn-sm" onClick={() => onDownload({ homeMode, home: homeMode === 'shared' ? home : undefined })}>
+          {t('instances.startDownload')}
+        </button>
+      </div>
+    </Modal>
+  )
+}
+
+/** Bundle detail modal: 整合包的社区插件清单(含中文简介),全部来自固化的静态数据。 */
+function BundleDetailModal({
+  bundle,
+  busy,
+  installed,
+  onClose,
+  onDownload
+}: {
+  bundle: RecommendedBundle
+  busy: boolean
+  installed: boolean
+  onClose: () => void
+  onDownload: () => void
+}): JSX.Element {
+  const { t } = useI18n()
+
+  return (
+    <Modal title={bundle.name} onClose={onClose} wide>
+      {installed && (
+        <span className="badge mb-2" style={{ color: 'var(--ok)', background: 'color-mix(in srgb, var(--ok) 14%, transparent)' }}>
+          {t('instances.downloaded')}
+        </span>
+      )}
+      {bundle.description && (
+        <p className="text-[12.5px] leading-relaxed" style={{ color: 'var(--muted)' }}>
+          {bundle.description}
+        </p>
+      )}
+
+      {/* 社区插件(计入数量) */}
+      <div>
+        <label className="label">{t('instances.bundleCommunity', { count: bundle.community.length })}</label>
+        <div className="space-y-1.5">
+          {bundle.community.map((p) => (
+            <div key={p.spec ?? p.name} className="rounded border px-3 py-2" style={{ borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2">
+                <span className="mono min-w-0 flex-1 truncate text-[12px]" style={{ color: 'var(--text)' }} title={p.spec}>
+                  {p.name ?? p.spec}
+                </span>
+                <span className="badge shrink-0" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>
+                  {t('instances.bundleGroupCommunity')}
+                </span>
+              </div>
+              {p.description && (
+                <p className="mt-1 line-clamp-2 text-[11.5px] leading-relaxed" style={{ color: 'var(--muted)' }}>
+                  {p.description}
+                </p>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex justify-end gap-2 border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+        <button className="btn btn-ghost btn-sm" onClick={onClose}>
+          {t('instances.close')}
+        </button>
+        <button className="btn btn-primary btn-sm" disabled={busy} onClick={onDownload}>
+          {installed ? t('instances.redownload') : t('instances.downloadBundle')}
+        </button>
+      </div>
+    </Modal>
+  )
+}
+
+/**
+ * 整合包下载进度弹窗:显示整体百分比 + 当前阶段 + 实时日志。
+ * 数据来自 installBundle 按包广播的整合包总进度任务(bundleTaskLabel(bundle)),不是独立请求。
+ */
+function BundleProgressModal({
+  bundle,
+  warnings,
+  failedSpecs,
+  onRetry,
+  onClose
+}: {
+  bundle: RecommendedBundle
+  warnings: string[]
+  /** 失败插件的 spec 清单(bundleFailed),非空时显示「一键重试」按钮。 */
+  failedSpecs: string[]
+  onRetry: () => void
+  onClose: () => void
+}): JSX.Element {
+  const { t } = useI18n()
+  const { tasks } = useHarness()
+  const task = tasks[bundleTaskLabel(bundle)]
+  const running = task?.running ?? false
+  const endedOk = task != null && !running && (task.code === 0 || task.progress === 1)
+  const failed = task != null && !running && task.code != null && task.code !== 0
+  const pct = task?.progress != null ? Math.round(task.progress * 100) : 0
+
+  const status = running
+    ? t('instances.bundleProgressRunning')
+    : endedOk
+      ? t('instances.bundleProgressDone')
+      : failed
+        ? t('instances.bundleProgressFailed')
+        : t('instances.bundleProgressIdle')
+
+  return (
+    <Modal title={t('instances.bundleProgress')} onClose={onClose} wide>
+      <div className="space-y-3">
+        <div className="flex items-end gap-3">
+          <span className="mono text-[34px] font-semibold leading-none">{pct}%</span>
+          <span className="pb-0.5 text-[12px]" style={{ color: 'var(--muted)' }}>
+            {status}
+          </span>
+        </div>
+        {task?.phase && (
+          <p className="text-[12px]" style={{ color: 'var(--muted)' }}>
+            {task.phase}
+          </p>
+        )}
+        {task ? (
+          <TaskConsole task={task} />
+        ) : (
+          <div className="rounded-lg border p-4 text-[12px]" style={{ borderColor: 'var(--border)', color: 'var(--muted)' }}>
+            {t('instances.bundleProgressPreparing')}
+          </div>
+        )}
+        {endedOk && warnings.length > 0 && (
+          <div className="select-text space-y-1 rounded-lg border px-3 py-2 text-[12px]" style={{ borderColor: 'var(--warn)', color: 'var(--warn)' }}>
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-medium">{t('instances.bundleWarningsTitle')}</div>
+              <div className="flex shrink-0 items-center gap-2">
+                {failedSpecs.length > 0 && (
+                  <button className="btn btn-primary btn-sm" onClick={onRetry} disabled={running}>
+                    {t('instances.bundleRetryFailed')}
+                  </button>
+                )}
+                <CopyButton text={warnings.join('\n')} title={t('common.copyAll')} />
+              </div>
+            </div>
+            {warnings.map((w, i) => (
+              <p key={i} className="leading-relaxed">
+                ⚠ {w}
+              </p>
+            ))}
+          </div>
+        )}
+        <div className="flex justify-end border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>
+            {t('instances.close')}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
+/** A small card per instance: name + user-set note + an enable/hide toggle. Click to edit. */
+function InstanceCard({
+  inst,
+  onOpen,
+  dragging = false,
+  dragOver = false,
+  onDragStart,
+  onDragOver,
+  onDragLeave,
+  onDrop,
+  onDragEnd,
+  exeMissing = false,
+  repairing = false,
+  onRepair
+}: {
+  inst: DshInstance
+  onOpen: () => void
+  dragging?: boolean
+  exeMissing?: boolean
+  repairing?: boolean
+  onRepair?: () => void
+  dragOver?: boolean
+  onDragStart?: React.DragEventHandler<HTMLDivElement>
+  onDragOver?: React.DragEventHandler<HTMLDivElement>
+  onDragLeave?: React.DragEventHandler<HTMLDivElement>
+  onDrop?: React.DragEventHandler<HTMLDivElement>
+  onDragEnd?: React.DragEventHandler<HTMLDivElement>
+}): JSX.Element {
+  const { t, lang } = useI18n()
+  const { states, refresh } = useHarness()
+  const st = states[inst.id]?.status ?? 'stopped'
+  const hidden = inst.enabled === false
+
+  const toggle = async (v: boolean): Promise<void> => {
+    await api.updateInstance(inst.id, { enabled: v })
+    await refresh()
+  }
+
+  return (
+    <div
+      className="card relative min-h-[120px] p-4 cursor-pointer select-none space-y-2 transition-opacity"
+      onClick={onOpen}
+      title={t('instances.edit')}
+      draggable={!!onDragStart}
+      onDragStart={onDragStart}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+      onDragEnd={onDragEnd}
+      style={{
+        opacity: hidden ? 0.55 : dragging ? 0.35 : 1,
+        outline: dragOver ? '2px solid var(--accent)' : undefined,
+        outlineOffset: dragOver ? 2 : undefined
+      }}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className="shrink-0 cursor-grab text-[12px] leading-none"
+            title={t('instances.dragToSort')}
+            style={{ color: 'var(--muted)' }}
+          >
+            ⋮⋮
+          </span>
+          {inst.icon ? (
+            <img src={guiIconSrc(inst.icon)} alt="" className="h-5 w-5 shrink-0 rounded" style={{ objectFit: 'contain' }} />
+          ) : (
+            <span className="badge-dot shrink-0" style={{ background: statusColor(st) }} />
+          )}
+          <span className="truncate text-[13px] font-semibold">{inst.name}</span>
+          {inst.kind === 'gui' && (
+            <span className="badge shrink-0" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>GUI</span>
+          )}
+          {hidden && (
+            <span
+              className="badge shrink-0"
+              style={{ color: 'var(--muted)', background: 'color-mix(in srgb, var(--muted) 14%, transparent)' }}
+            >
+              {t('instances.hidden')}
+            </span>
+          )}
+        </div>
+        <label
+          className="flex shrink-0 cursor-pointer items-center gap-1.5"
+          onClick={(e) => e.stopPropagation()}
+          title={t('instances.show')}
+        >
+          <span className="text-[11px]" style={{ color: 'var(--muted)' }}>
+            {t('instances.show')}
+          </span>
+          <Toggle checked={!hidden} onChange={(v) => void toggle(v)} />
+        </label>
+      </div>
+      <div
+        className="line-clamp-2 min-h-[30px] break-words text-[11.5px] leading-relaxed"
+        style={{ color: 'var(--muted)', paddingRight: exeMissing ? '1.75rem' : undefined }}
+      >
+        {inst.description || <span className="opacity-60">{t('instances.noDescription')}</span>}
+      </div>
+      {isDshInstance(inst) && <div className="truncate mono text-[10px]" style={{ color: 'var(--muted)' }} title={inst.runtimeVersion}>
+        DSH · {inst.runtimeVersion ? `${lang === 'en' ? 'Pinned' : '固定'} ${inst.runtimeVersion}` : (lang === 'en' ? 'Shared runtime' : '跟随全局运行环境')}
+      </div>}
+      {inst.kind === 'gui' && exeMissing && (
+        <button
+          type="button"
+          aria-label={repairing ? t('instances.guiRepairing') : t('instances.guiPathMissing')}
+          className="absolute bottom-3.5 right-3.5 flex h-5 w-5 cursor-pointer items-center justify-center rounded-md border-0 p-0"
+          style={{ color: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 16%, transparent)' }}
+          onClick={(event) => {
+            event.stopPropagation()
+            onRepair?.()
+          }}
+          title={repairing ? t('instances.guiRepairing') : t('instances.guiPathMissing')}
+        >
+          {repairing ? <span className="animate-spin"><RefreshIcon /></span> : <WarningIcon />}
+        </button>
+      )}
+    </div>
+  )
+}
+
+interface InstancesProps {
+  onOpenWebChat?: (chat: { id: string; url: string }, popout: boolean) => void
+  onOpenNewTab?: () => void
+}
+
+/** Non-home groups manage membership: home items stay above the divider, group-owned links below it. */
+function GroupInstancesView({ group, onOpenWebChat, onOpenNewTab }: { group: Group } & InstancesProps): JSX.Element {
+  const { t } = useI18n()
+  const { config, instances, states, saveConfig } = useHarness()
+  const [editing, setEditing] = useState<WebChatConfig | null>(null)
+  const [editName, setEditName] = useState('')
+  const [editDescription, setEditDescription] = useState('')
+  const [editUrl, setEditUrl] = useState('')
+  const [editError, setEditError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const allInstances = instances.filter((instance) => instance.enabled !== false)
+  const commonLinks = (config?.webChats ?? []).filter((link) => !link.archived && !link.groupId && !link.hidden)
+  const privateLinks = (config?.webChats ?? []).filter((link) => !link.archived && link.groupId === group.id)
+  const visibleInstances = new Set(group.visibleInstances)
+  const visibleLinks = new Set(group.visibleLinks)
+
+  const toggleInstance = async (instanceId: string, checked: boolean): Promise<void> => {
+    await saveConfig({ groups: setGroupItemVisible(config?.groups ?? [], group.id, 'instance', instanceId, checked) })
+  }
+  const toggleLink = async (linkId: string, checked: boolean): Promise<void> => {
+    await saveConfig({ groups: setGroupItemVisible(config?.groups ?? [], group.id, 'link', linkId, checked) })
+  }
+
+  const beginEdit = (link: WebChatConfig): void => {
+    setEditing(link)
+    setEditName(link.name)
+    setEditDescription(link.description)
+    setEditUrl(link.url)
+    setEditError(null)
+  }
+
+  const saveEdit = async (): Promise<void> => {
+    if (!editing) return
+    const url = normalizeHttpUrl(editUrl)
+    if (!url) {
+      setEditError(t('newTab.invalidUrl'))
+      return
+    }
+    setBusy(true)
+    try {
+      const next: WebChatConfig = {
+        ...editing,
+        name: editName.trim() || url,
+        description: editDescription.trim(),
+        url
+      }
+      await saveConfig({ webChats: (config?.webChats ?? []).map((link) => link.id === editing.id ? next : link) })
+      if (editing.url !== url) api.releaseWebChat(editing.id)
+      setEditing(null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const removePrivateLink = async (): Promise<void> => {
+    if (!editing) return
+    if (!(await api.confirm(t('instances.privateLinkDeleteConfirm', { name: editing.name })))) return
+    setBusy(true)
+    try {
+      await saveConfig({ webChats: (config?.webChats ?? []).filter((link) => link.id !== editing.id) })
+      api.releaseWebChat(editing.id)
+      setEditing(null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="p-5 space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <h2 className="text-[18px] font-semibold">{t('instances.groupScopeTitle', { group: group.name })}</h2>
+            <span className="rounded-full px-2 py-0.5 text-[10px]" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>
+              {group.kind === 'home' ? t('groups.typeHome') : t('groups.typeGroup')}
+            </span>
+          </div>
+          <p className="mt-1 text-[12px] leading-relaxed" style={{ color: 'var(--muted)' }}>{t('instances.groupScopeHint')}</p>
+        </div>
+        <button className="btn btn-primary btn-sm" onClick={onOpenNewTab} disabled={!onOpenNewTab}>
+          ＋ {t('instances.addPrivateLink')}
+        </button>
+      </div>
+
+      <section className="space-y-2">
+        <div className="flex items-center justify-between px-1">
+          <h3 className="text-[14px] font-semibold">{t('instances.homeInstances')}</h3>
+          <span className="text-[11px]" style={{ color: 'var(--muted)' }}>
+            {t('instances.visibleCount', { visible: allInstances.filter((instance) => visibleInstances.has(instance.id)).length, total: allInstances.length })}
+          </span>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {allInstances.map((instance) => {
+            const status = states[instance.id]?.status ?? 'stopped'
+            return (
+              <div key={instance.id} className="card flex min-h-[82px] items-center gap-3 p-3.5">
+                {(instance.icon || instance.iconColor || instance.iconChar) ? (
+                  <GlyphTile icon={instance.icon} letter={instance.iconChar || instance.name} color={instance.iconColor ?? fallbackColor(instance.name)} size={34} />
+                ) : (
+                  <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: statusColor(status) }} />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-[13px] font-semibold">{instance.name}</span>
+                    <span className="rounded px-1.5 py-0.5 text-[9.5px]" style={{ color: 'var(--muted)', background: 'var(--bg-soft)' }}>
+                      {t('instances.homeBadge')}
+                    </span>
+                  </div>
+                  <div className="mt-1 truncate text-[11px]" style={{ color: 'var(--muted)' }}>
+                    {instance.description || t('instances.noDescription')}
+                  </div>
+                </div>
+                <label className="flex shrink-0 items-center gap-1.5 text-[11px]" style={{ color: 'var(--muted)' }}>
+                  {t('instances.show')}
+                  <Toggle checked={visibleInstances.has(instance.id)} onChange={(checked) => void toggleInstance(instance.id, checked)} />
+                </label>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+
+      <section className="space-y-2">
+        <div className="flex items-center justify-between px-1">
+          <h3 className="text-[14px] font-semibold">{t('instances.homeSharedLinks')}</h3>
+          <span className="text-[11px]" style={{ color: 'var(--muted)' }}>
+            {t('instances.visibleCount', { visible: commonLinks.filter((link) => visibleLinks.has(link.id)).length, total: commonLinks.length })}
+          </span>
+        </div>
+        {commonLinks.length === 0 ? (
+          <div className="card px-4 py-5 text-[12px]" style={{ color: 'var(--muted)' }}>{t('newTab.noLinks')}</div>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {commonLinks.map((link) => (
+              <div key={link.id} className="card flex min-h-[70px] items-center gap-3 p-3.5">
+                <GlyphTile icon={link.icon} letter={link.name} color={link.iconColor ?? fallbackColor(link.name)} size={32} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px] font-semibold">{link.name}</div>
+                  <div className="truncate text-[10.5px]" style={{ color: 'var(--muted)' }}>{link.url}</div>
+                </div>
+                <label className="flex shrink-0 items-center gap-1.5 text-[11px]" style={{ color: 'var(--muted)' }}>
+                  {t('instances.show')}
+                  <Toggle checked={visibleLinks.has(link.id)} onChange={(checked) => void toggleLink(link.id, checked)} />
+                </label>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <div className="flex items-center gap-4 py-2">
+        <div className="h-px flex-1" style={{ background: 'var(--border-strong)' }} />
+        <span className="text-[11px] font-semibold uppercase tracking-[0.16em]" style={{ color: 'var(--muted)' }}>{t('instances.privateSection')}</span>
+        <div className="h-px flex-1" style={{ background: 'var(--border-strong)' }} />
+      </div>
+
+      <section className="space-y-2">
+        <div className="flex items-center justify-between px-1">
+          <h3 className="text-[14px] font-semibold">{t('instances.privateLinks')}</h3>
+          <span className="text-[11px]" style={{ color: 'var(--muted)' }}>{privateLinks.length}</span>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {privateLinks.map((link) => (
+            <div key={link.id} className="card flex min-h-[82px] items-center gap-3 p-3.5">
+              <button
+                className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                onClick={() => onOpenWebChat?.({ id: link.id, url: link.url }, false)}
+                title={t('newTab.open')}
+              >
+                <GlyphTile icon={link.icon} letter={link.name} color={link.iconColor ?? fallbackColor(link.name)} size={34} />
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-center gap-2">
+                    <span className="truncate text-[13px] font-semibold">{link.name}</span>
+                    <span className="rounded px-1.5 py-0.5 text-[9.5px]" style={{ color: 'var(--accent)', background: 'var(--accent-soft)' }}>
+                      {t('instances.privateBadge')}
+                    </span>
+                  </span>
+                  <span className="mt-1 block truncate text-[10.5px]" style={{ color: 'var(--muted)' }}>{link.url}</span>
+                </span>
+              </button>
+              <button className="btn btn-ghost btn-sm shrink-0" onClick={() => beginEdit(link)}>{t('instances.editPrivate')}</button>
+            </div>
+          ))}
+          <button
+            className="flex min-h-[82px] flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed text-[12.5px] transition-colors hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+            style={{ borderColor: 'var(--border-strong)' }}
+            onClick={onOpenNewTab}
+            disabled={!onOpenNewTab}
+          >
+            <span className="flex items-center gap-1.5 font-semibold"><PlusIcon /> {t('instances.addPrivateLink')}</span>
+            <span className="text-[10.5px]" style={{ color: 'var(--muted)' }}>{t('instances.addPrivateHint')}</span>
+          </button>
+        </div>
+      </section>
+
+      <p className="px-1 text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.groupScopeFooter')}</p>
+
+      {editing && (
+        <Modal title={t('instances.editPrivateLink')} onClose={() => setEditing(null)}>
+          <div className="space-y-3">
+            <label className="block space-y-1 text-[13px]">
+              <span>{t('webChat.nameLabel')}</span>
+              <input className="input" value={editName} onChange={(event) => setEditName(event.target.value)} />
+            </label>
+            <label className="block space-y-1 text-[13px]">
+              <span>{t('webChat.descLabel')}</span>
+              <textarea className="input resize-none" rows={2} value={editDescription} onChange={(event) => setEditDescription(event.target.value)} />
+            </label>
+            <label className="block space-y-1 text-[13px]">
+              <span>{t('webChat.urlLabel')}</span>
+              <input className="input mono" value={editUrl} onChange={(event) => setEditUrl(event.target.value)} />
+            </label>
+            {editError && <div className="text-[11.5px]" style={{ color: 'var(--err)' }}>{editError}</div>}
+            <div className="flex items-center justify-between border-t pt-3" style={{ borderColor: 'var(--border)' }}>
+              <button className="btn btn-danger btn-sm" disabled={busy} onClick={() => void removePrivateLink()}>{t('instances.deletePrivateLink')}</button>
+              <div className="flex gap-2">
+                <button className="btn btn-ghost btn-sm" onClick={() => setEditing(null)}>{t('instances.close')}</button>
+                <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => void saveEdit()}>{t('webChat.save')}</button>
+              </div>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  )
+}
+function InstancesHome({ onOpenWebChat }: InstancesProps): JSX.Element {
+  const { t } = useI18n()
+  const { instances, refresh, tasks, config, saveConfig } = useHarness()
+  const [editing, setEditing] = useState<DshInstance | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [bundleBusy, setBundleBusy] = useState<string | null>(null)
+  const [draggingInstanceId, setDraggingInstanceId] = useState<string | null>(null)
+  const [dragOverInstanceId, setDragOverInstanceId] = useState<string | null>(null)
+  const [executableHealth, setExecutableHealth] = useState<Record<string, { exe: string; available: boolean }>>({})
+  const [repairingExe, setRepairingExe] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    const gui = instances.filter((inst) => inst.kind === 'gui' && inst.exe)
+    void Promise.all(gui.map(async (inst) => [inst.id, await api.checkGuiExecutable(inst.id)] as const))
+      .then((entries) => { if (alive) setExecutableHealth(Object.fromEntries(entries)) })
+      .catch(() => { /* keep previous health state */ })
+    return () => { alive = false }
+  }, [instances])
+  const repairExe = async (inst: DshInstance): Promise<void> => {
+    setRepairingExe(inst.id)
+    try {
+      const result = await api.repairGuiExecutable(inst.id)
+      if (result.ok) await refresh()
+    } finally {
+      setRepairingExe(null)
+    }
+  }
+  // 网页版免费对话(虚拟实例)列表 + 编辑/新建弹窗。
+  // 注意:不能对空数组回退默认卡——用户删空后应保持为空,否则删一个又出现一个。
+  const webChats: WebChatConfig[] = (Array.isArray(config?.webChats) ? config.webChats : []).filter((chat) => !chat.archived && !chat.groupId)
+  const webChatProfiles = (config?.profiles ?? []).filter((profile) => !profile.archived)
+  const [editWebChat, setEditWebChat] = useState<WebChatConfig | null>(null)
+  const [creatingWebChat, setCreatingWebChat] = useState(false)
+  const [wcName, setWcName] = useState('')
+  const [wcDesc, setWcDesc] = useState('')
+  const [wcUrl, setWcUrl] = useState('')
+  const [wcHidden, setWcHidden] = useState(false)
+  const [wcProfileId, setWcProfileId] = useState(DEFAULT_PROFILE_ID)
+  const openWebChatDetail = (wc: WebChatConfig): void => {
+    setEditWebChat(wc); setWcName(wc.name); setWcDesc(wc.description); setWcUrl(wc.url); setWcHidden(wc.hidden); setWcProfileId(wc.profileId ?? DEFAULT_PROFILE_ID)
+  }
+  const openNewWebChat = (): void => {
+    setEditWebChat(null); setCreatingWebChat(true); setWcName(''); setWcDesc(''); setWcUrl('https://chat.deepseek.com'); setWcHidden(false); setWcProfileId(DEFAULT_PROFILE_ID)
+  }
+  const saveWebChat = async (): Promise<WebChatConfig | null> => {
+    const name = wcName.trim() || '网页版免费对话'
+    const url = wcUrl.trim() || 'https://chat.deepseek.com'
+    const next: WebChatConfig = {
+      ...editWebChat,
+      id: editWebChat?.id ?? `web-${Date.now()}`,
+      name, description: wcDesc.trim(), url, hidden: wcHidden,
+      profileId: wcProfileId === DEFAULT_PROFILE_ID ? undefined : wcProfileId,
+      iconColor: editWebChat?.iconColor ?? '#4F7DFF'
+    }
+    const list = editWebChat
+      ? webChats.map((w) => (w.id === editWebChat.id ? next : w))
+      : [...webChats, next]
+    await saveConfig({ webChats: list })
+    setEditWebChat(null); setCreatingWebChat(false)
+    await refresh()
+    // 已有卡且改了链接:旧地址的常驻页面已无意义,立即释放,下次打开按新地址加载。
+    if (editWebChat && editWebChat.url !== next.url) api.releaseWebChat(editWebChat.id)
+    return next
+  }
+  // 「打开」= 保存当前编辑(新建即创建)后,以内嵌方式打开该卡(切换不重载;改过 url 已释放,会按新 url 加载)。
+  const saveAndOpenWebChat = async (): Promise<void> => {
+    const saved = await saveWebChat()
+    if (!saved) return
+    if (onOpenWebChat) onOpenWebChat({ id: saved.id, url: saved.url }, false)
+    else void api.setWebChat(true, saved.id, saved.url, false)
+  }
+  const removeWebChat = async (id: string): Promise<void> => {
+    await saveConfig({ webChats: webChats.filter((w) => w.id !== id) })
+    setEditWebChat(null)
+    api.releaseWebChat(id) // 立即释放该卡常驻视图,不等 30 分钟
+    await refresh()
+  }
+  const toggleWebChatHidden = async (id: string, hidden: boolean): Promise<void> => {
+    await saveConfig({ webChats: webChats.map((w) => (w.id === id ? { ...w, hidden } : w)) })
+    await refresh()
+  }
+  // 整合包清单:全部由在线库提供(拉取失败回退内置)。
+  const [remoteBundles, setRemoteBundles] = useState<RecommendedBundle[] | null>(null)
+  const [packConnected, setPackConnected] = useState(false)
+  useEffect(() => {
+    void api.bundles().then((r) => { setRemoteBundles(r.bundles); setPackConnected(r.connected) }).catch(() => { /* 网络失败 → 用内置整合包 */ })
+  }, [])
+  const [bundleError, setBundleError] = useState<string | null>(null)
+  const [bundleNote, setBundleNote] = useState<string[] | null>(null)
+  // 失败插件的 spec 清单(带归属整合包):驱动「一键重试」按钮。
+  const [bundleFailed, setBundleFailed] = useState<{ bundle: RecommendedBundle; specs: string[] } | null>(null)
+  // 待下载整合包的数据目录确认弹窗:点「下载」先选共享/独立 + 目标 home,再开始安装。
+  const [homePick, setHomePick] = useState<RecommendedBundle | null>(null)
+  const [viewing, setViewing] = useState<RecommendedBundle | null>(null)
+  // 整合包下载进度弹窗:点「下载」即打开,结束后可手动关闭(后台任务不受影响)。
+  // 记录当前展示的包,进度标签按包派生(多整合包并存时各看各的)。
+  const [progressBundle, setProgressBundle] = useState<RecommendedBundle | null>(null)
+  // 防呆:state 更新是异步的,连点两次可能在 render 前连跑两次 downloadBundle;
+  // 用 ref 做同步门闩,installBundle 本身虽幂等复用同名实例,但重复触发仍会重跑一遍安装。
+  const bundleInFlight = useRef<string | null>(null)
+  // 「关于整合包」/「什么是实例?」问答弹窗
+  const [qa, setQa] = useState<'bundle' | 'instance' | null>(null)
+
+  const downloadBundle = async (
+    bundle: RecommendedBundle,
+    options?: { homeMode?: 'shared' | 'isolated'; home?: string; retrySpecs?: string[] }
+  ): Promise<void> => {
+    if (bundleInFlight.current !== null) return
+    bundleInFlight.current = bundle.id
+    setBundleBusy(bundle.id)
+    setBundleError(null)
+    setBundleNote(null)
+    setBundleFailed(null)
+    setProgressBundle(bundle)
+    // 从详情弹窗发起下载时,先关掉详情,让进度弹窗独占屏幕。
+    setViewing(null)
+    try {
+      // options:homeMode/home = 新建实例的数据目录选择;retrySpecs = 上次失败的 spec 清单,
+      // main 侧只重装这些插件,不重建实例、不重装已成功的。
+      const r = await api.installBundle(bundle.id, options)
+      if (!r.ok) {
+        setBundleError(r.error ?? t('instances.bundleDownloadFailed'))
+        return
+      }
+      // Non-fatal notes (skipped sub-packages, failed plugins, …):逐条列出,
+      // 进度弹窗与页面卡片下方都会展示,方便用户知道哪些没装上。
+      if (r.warnings?.length) setBundleNote(r.warnings)
+      // 失败插件的 spec 清单:供「一键重试」按钮原样传回 installBundle。
+      if (r.bundleFailed?.length) setBundleFailed({ bundle, specs: r.bundleFailed })
+      // Reload the config so the freshly-created instance shows up in the grid.
+      await refresh()
+    } finally {
+      bundleInFlight.current = null
+      setBundleBusy(null)
+    }
+  }
+
+  /** 一键重试失败插件:只对上次失败的 spec 重新 `dsh plugin add`,成功项不动。 */
+  const retryFailedPlugins = async (bundle: RecommendedBundle): Promise<void> => {
+    const failed = bundleFailed
+    if (!failed || failed.specs.length === 0 || failed.bundle.id !== bundle.id) return
+    await downloadBundle(bundle, { retrySpecs: failed.specs })
+  }
+
+  const reorderInstance = async (sourceId: string, targetId: string): Promise<void> => {
+    const next = reorderInstanceItems(instances, sourceId, targetId)
+    if (next.every((inst, index) => inst.id === instances[index]?.id)) return
+    await saveConfig({ instances: next })
+    await refresh()
+  }
+
+  const clearDragState = (): void => {
+    setDraggingInstanceId(null)
+    setDragOverInstanceId(null)
+  }
+
+  // 防呆:同名实例已存在 = 整合包已下载过 → 卡片按钮置灰显示「已下载」,
+  // 避免用户多次点同一个整合包的下载;仍可从详情弹窗显式「重新下载」。
+  const installedNames = useMemo(() => new Set(instances.map((i) => i.name)), [instances])
+
+  return (
+    <div className="p-5 space-y-5">
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2.5">
+          <h2 className="text-[18px] font-semibold">{t('nav.instances')}</h2>
+          <button
+            type="button"
+            className="shrink-0 text-[12px] transition-colors hover:text-[var(--accent)] hover:underline"
+            style={{ color: 'var(--muted)' }}
+            onClick={() => setQa('instance')}
+          >
+            {t('instances.whatIsInstance')}
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {instances.map((inst) => (
+          <InstanceCard
+            key={inst.id}
+            inst={inst}
+            onOpen={() => setEditing(inst)}
+            exeMissing={executableHealth[inst.id]?.available === false}
+            repairing={repairingExe === inst.id}
+            onRepair={() => void repairExe(inst)}
+            dragging={draggingInstanceId === inst.id}
+            dragOver={dragOverInstanceId === inst.id && draggingInstanceId !== inst.id}
+            onDragStart={instances.length > 1 ? (e) => {
+              setDraggingInstanceId(inst.id)
+              e.dataTransfer.effectAllowed = 'move'
+              e.dataTransfer.setData('text/plain', inst.id)
+            } : undefined}
+            onDragOver={instances.length > 1 ? (e) => {
+              if (!draggingInstanceId || draggingInstanceId === inst.id) return
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'move'
+              setDragOverInstanceId(inst.id)
+            } : undefined}
+            onDragLeave={() => setDragOverInstanceId((id) => id === inst.id ? null : id)}
+            onDrop={instances.length > 1 ? (e) => {
+              e.preventDefault()
+              const source = e.dataTransfer.getData('text/plain') || draggingInstanceId
+              if (source) void reorderInstance(source, inst.id)
+              clearDragState()
+            } : undefined}
+            onDragEnd={clearDragState}
+          />
+        ))}
+        {/* 网页版免费对话(虚拟实例)卡片:与实例卡一致——右上「显示」控制侧边栏隐藏,
+            隐藏时打「已隐藏」标签并整体变灰;点卡片打开详情设置 */}
+        {webChats.map((wc) => {
+          const hidden = wc.hidden
+          return (
+            <div
+              key={wc.id}
+              className="h-[104px] p-4 cursor-pointer select-none space-y-2 rounded-xl border transition-opacity"
+              style={{ borderColor: 'var(--border)', background: 'transparent', opacity: hidden ? 0.55 : 1 }}
+              onClick={() => openWebChatDetail(wc)}
+              title={t('webChat.hint')}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="badge-dot shrink-0" style={{ background: 'var(--muted)' }} />
+                  <span className="truncate text-[13px] font-semibold">{wc.name}</span>
+                  {hidden && (
+                    <span className="badge shrink-0" style={{ color: 'var(--muted)', background: 'color-mix(in srgb, var(--muted) 14%, transparent)' }}>
+                      {t('instances.hidden')}
+                    </span>
+                  )}
+                </div>
+                <label
+                  className="flex shrink-0 cursor-pointer items-center gap-1.5"
+                  onClick={(e) => e.stopPropagation()}
+                  title={t('instances.show')}
+                >
+                  <span className="text-[11px]" style={{ color: 'var(--muted)' }}>{t('instances.show')}</span>
+                  <Toggle checked={!hidden} onChange={(v) => void toggleWebChatHidden(wc.id, !v)} />
+                </label>
+              </div>
+              <div className="line-clamp-2 min-h-[30px] break-words text-[11.5px]" style={{ color: 'var(--muted)' }}>
+                {wc.description || t('webChat.hint')}
+              </div>
+            </div>
+          )
+        })}
+
+        {/* 新建实例/链接入口:虚线框;两段各自可点,悬停到哪个哪个亮蓝 */}
+        <div className="h-[104px] p-4 flex items-center justify-center rounded-xl border-2 border-dashed" style={{ borderColor: 'var(--border-strong)', background: 'transparent' }}>
+          <div className="flex items-center gap-1">
+            <button
+              className="flex select-none cursor-pointer items-center gap-2 rounded px-1.5 py-1 transition-colors hover:text-[var(--accent)]"
+              onClick={() => setCreating(true)}
+              title={t('settings.addInstance')}
+            >
+              <PlusIcon />
+              <span className="text-[13px] font-semibold">{t('settings.addInstance')}</span>
+            </button>
+            <span className="text-[13px] font-semibold" style={{ color: 'var(--muted)' }}>/</span>
+            <button
+              className="select-none cursor-pointer rounded px-1.5 py-1 text-[13px] font-semibold transition-colors hover:text-[var(--accent)]"
+              onClick={openNewWebChat}
+              title={t('webChat.newLink')}
+            >
+              {t('webChat.newLink')}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* 网页版免费对话(虚拟实例)详情/新建:名称 / 介绍 / 地址 / 侧边栏显示;新建含厂商预设 */}
+      {(editWebChat || creatingWebChat) && (
+        <Modal title={creatingWebChat ? t('webChat.newTitle') : t('webChat.settingsTitle')} onClose={() => { setEditWebChat(null); setCreatingWebChat(false) }}>
+          <div className="space-y-3">
+            {creatingWebChat && (
+              <label className="block space-y-1 text-[13px]">
+                <span>{t('webChat.presets')}</span>
+                <select
+                  className="w-full rounded-[8px] border px-2 py-1 text-[12.5px]"
+                  style={{ borderColor: 'var(--border)', background: 'var(--bg-soft)', color: 'var(--text)' }}
+                  value=""
+                  onChange={(e) => {
+                    const p = WEB_CHAT_PRESETS.find((x) => x.url === e.target.value)
+                    if (p) { setWcName(p.name); setWcUrl(p.url) }
+                  }}
+                >
+                  <option value="">{t('webChat.presetPlaceholder')}</option>
+                  {WEB_CHAT_PRESETS.map((p) => (
+                    <option key={p.url} value={p.url}>{p.name}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <label className="block space-y-1 text-[13px]">
+              <span>{t('webChat.nameLabel')}</span>
+              <input
+                className="w-full rounded-[8px] border px-2 py-1 text-[12.5px]"
+                style={{ borderColor: 'var(--border)', background: 'var(--bg-soft)', color: 'var(--text)' }}
+                value={wcName}
+                onChange={(e) => setWcName(e.target.value)}
+              />
+            </label>
+            <label className="block space-y-1 text-[13px]">
+              <span>{t('webChat.descLabel')}</span>
+              <textarea
+                className="w-full rounded-[8px] border px-2 py-1 text-[12.5px] resize-none"
+                style={{ borderColor: 'var(--border)', background: 'var(--bg-soft)', color: 'var(--text)' }}
+                rows={2}
+                value={wcDesc}
+                onChange={(e) => setWcDesc(e.target.value)}
+              />
+            </label>
+            <label className="block space-y-1 text-[13px]">
+              <span>{t('webChat.urlLabel')}</span>
+              <input
+                className="w-full rounded-[8px] border px-2 py-1 text-[12.5px] mono"
+                style={{ borderColor: 'var(--border)', background: 'var(--bg-soft)', color: 'var(--text)' }}
+                value={wcUrl}
+                onChange={(e) => setWcUrl(e.target.value)}
+              />
+            </label>
+            <label className="block space-y-1 text-[13px]">
+              <span>{t('newTab.profile')}</span>
+              <select
+                className="w-full rounded-[8px] border px-2 py-1 text-[12.5px]"
+                style={{ borderColor: 'var(--border)', background: 'var(--bg-soft)', color: 'var(--text)' }}
+                value={wcProfileId}
+                onChange={(e) => setWcProfileId(e.target.value)}
+              >
+                {webChatProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.id === DEFAULT_PROFILE_ID ? t('newTab.profileNoIsolation') : profile.name}
+                  </option>
+                ))}
+              </select>
+              <span className="text-[10.5px]" style={{ color: 'var(--muted)' }}>{t('newTab.profileIsolationHint')}</span>
+            </label>
+            <label className="flex items-center justify-between gap-3 text-[13px] cursor-pointer">
+              <span>{t('webChat.showSidebar')}</span>
+              <Toggle checked={!wcHidden} onChange={(v) => setWcHidden(!v)} />
+            </label>
+            <div className="flex items-center justify-between gap-2 pt-1">
+              {editWebChat ? (
+                <button className="btn btn-ghost btn-sm" style={{ color: 'var(--err)' }} onClick={() => void removeWebChat(editWebChat.id)}>
+                  {t('webChat.delete')}
+                </button>
+              ) : <span />}
+              <div className="flex items-center gap-2">
+                <button className="btn btn-ghost btn-sm" onClick={() => void saveAndOpenWebChat()}>{t('webChat.open')}</button>
+                <button className="btn btn-primary btn-sm" onClick={() => void saveWebChat()}>{t('webChat.save')}</button>
+              </div>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* Recommended bundles: download a bundle to get a new pre-configured instance. */}
+      <div className="border-t pt-4" style={{ borderColor: 'var(--border)' }}>
+        <div className="flex items-center gap-2.5">
+          <h3 className="text-[13px] font-medium" style={{ color: 'var(--muted)' }}>
+            {t('instances.recommendedBundles')}
+          </h3>
+          <button
+            type="button"
+            className="shrink-0 text-[12px] transition-colors hover:text-[var(--accent)] hover:underline"
+            style={{ color: 'var(--muted)' }}
+            onClick={() => setQa('bundle')}
+          >
+            {t('instances.aboutBundle')}
+          </button>
+        </div>
+        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          {(remoteBundles ?? RECOMMENDED_BUNDLES).map((bundle) => {
+            // 下载中判定:installBundle 进行中(bundleBusy)且该包有进度任务;
+            // 点击卡片回到进度弹窗而不是重复下载,百分比从总进度任务实时取。
+            const task = tasks[bundleTaskLabel(bundle)]
+            const downloading = bundleBusy === bundle.id
+            const pct = task?.progress != null ? Math.round(task.progress * 100) : 0
+            return (
+            <div
+              key={bundle.id}
+              className={`card space-y-2 cursor-pointer select-none p-4 transition-opacity ${downloading ? 'pulse-live' : ''}`}
+              onClick={() => (downloading ? setProgressBundle(bundle) : setViewing(bundle))}
+              title={downloading ? t('instances.bundleOpenProgress') : t('instances.bundleDetails')}
+            >
+              <div className="text-[13px] font-semibold">{bundle.name}</div>
+              <div className="line-clamp-2 min-h-[30px] break-words text-[11.5px] leading-relaxed" style={{ color: 'var(--muted)' }}>
+                {bundle.description}
+              </div>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="text-[11px] mono" style={{ color: 'var(--muted)' }}>
+                  {t('instances.bundlePluginCount', { count: bundleCount(bundle) })}
+                </span>
+              </div>
+              {downloading && (
+                <div className="flex items-center gap-2">
+                  <div
+                    className="h-1.5 flex-1 overflow-hidden rounded-full"
+                    style={{ background: 'color-mix(in srgb, var(--accent) 18%, transparent)' }}
+                  >
+                    <div
+                      className="h-full animate-pulse rounded-full transition-[width] duration-300"
+                      style={{ background: 'var(--accent)', width: `${Math.max(pct, 4)}%` }}
+                    />
+                  </div>
+                  <span className="mono shrink-0 text-[11px] tabular-nums" style={{ color: 'var(--accent)' }}>
+                    {pct}%
+                  </span>
+                </div>
+              )}
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  className="btn btn-primary btn-sm"
+                  disabled={installedNames.has(bundle.name) || (bundleBusy !== null && bundleBusy !== bundle.id)}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    // 下载中:点击当前整合包的按钮 = 重新打开进度弹窗,而不是重复下载。
+                    if (bundleBusy === bundle.id) {
+                      setProgressBundle(bundle)
+                      return
+                    }
+                    // 已下载过:卡片按钮置灰,不重复触发(想重装去详情弹窗)。
+                    if (installedNames.has(bundle.name)) return
+                    // 未安装:先弹数据目录确认(共享/独立 + 目标 home),再开始安装。
+                    setHomePick(bundle)
+                  }}
+                >
+                  {bundleBusy === bundle.id
+                    ? t('instances.downloading')
+                    : installedNames.has(bundle.name)
+                      ? t('instances.downloaded')
+                      : t('instances.downloadBundle')}
+                </button>
+                <span className="shrink-0 text-[11px]" style={{ color: 'var(--accent)' }}>
+                  {t('instances.bundleDetails')} →
+                </span>
+              </div>
+            </div>
+            )
+          })}
+        </div>
+        {packConnected && (
+          <div className="flex justify-end pt-1.5">
+            <span className="text-[11px]" style={{ color: 'var(--ok)' }}>{t('instances.packConnected')}</span>
+          </div>
+        )}
+        {bundleError && (
+          <div className="mt-2 flex items-start justify-between gap-2 text-[12px]" style={{ color: 'var(--err)' }}>
+            <p className="select-text break-all">{bundleError}</p>
+            <CopyButton text={bundleError} />
+          </div>
+        )}
+        {bundleNote && bundleNote.length > 0 && (
+          <div
+            className="mt-2 select-text space-y-1 rounded-lg border px-3 py-2 text-[12px]"
+            style={{ borderColor: 'var(--warn)', color: 'var(--warn)' }}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-medium">{t('instances.bundleWarningsTitle')}</div>
+              <div className="flex shrink-0 items-center gap-2">
+                {bundleFailed && bundleFailed.specs.length > 0 && bundleBusy === null && (
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={() => void retryFailedPlugins(bundleFailed.bundle)}
+                  >
+                    {t('instances.bundleRetryFailed')}
+                  </button>
+                )}
+                <CopyButton text={bundleNote.join('\n')} title={t('common.copyAll')} />
+              </div>
+            </div>
+            {bundleNote.map((w, i) => (
+              <p key={i} className="leading-relaxed">
+                ⚠ {w}
+              </p>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {editing && <EditInstanceModal inst={editing} onClose={() => setEditing(null)} />}
+      {creating && <NewInstanceModal onClose={() => setCreating(false)} />}
+      {viewing && (
+        <BundleDetailModal
+          bundle={viewing}
+          busy={bundleBusy !== null}
+          installed={installedNames.has(viewing.name)}
+          onClose={() => setViewing(null)}
+          onDownload={() => {
+            // 重新下载(实例已存在,home 已固定):直接重跑安装,不选数据目录。
+            if (installedNames.has(viewing.name)) {
+              void downloadBundle(viewing)
+            } else {
+              // 首次下载:先弹数据目录确认。
+              setHomePick(viewing)
+            }
+          }}
+        />
+      )}
+      {homePick && (
+        <BundleHomeModal
+          bundle={homePick}
+          onClose={() => setHomePick(null)}
+          onDownload={(opts) => {
+            const b = homePick
+            setHomePick(null)
+            void downloadBundle(b, opts)
+          }}
+        />
+      )}
+      {progressBundle && (
+        <BundleProgressModal
+          bundle={progressBundle}
+          warnings={bundleNote ?? []}
+          failedSpecs={bundleFailed?.specs ?? []}
+          onRetry={() => {
+            if (bundleFailed) void retryFailedPlugins(bundleFailed.bundle)
+          }}
+          onClose={() => setProgressBundle(null)}
+        />
+      )}
+      {qa === 'bundle' && (
+        <QaModal
+          title={t('instances.qaBundleTitle')}
+          onClose={() => setQa(null)}
+          qa={[
+            { q: t('instances.qaBundle.1.q'), a: t('instances.qaBundle.1.a') },
+            { q: t('instances.qaBundle.2.q'), a: t('instances.qaBundle.2.a') },
+            { q: t('instances.qaBundle.3.q'), a: t('instances.qaBundle.3.a') },
+            { q: t('instances.qaBundle.4.q'), a: t('instances.qaBundle.4.a') },
+            { q: t('instances.qaBundle.5.q'), a: t('instances.qaBundle.5.a') },
+            { q: t('instances.qaBundle.6.q'), a: t('instances.qaBundle.6.a') },
+            { q: t('instances.qaBundle.7.q'), a: t('instances.qaBundle.7.a') }
+          ]}
+        />
+      )}
+      {qa === 'instance' && (
+        <QaModal
+          title={t('instances.qaInstanceTitle')}
+          onClose={() => setQa(null)}
+          qa={[
+            { q: t('instances.qaInstance.1.q'), a: t('instances.qaInstance.1.a') },
+            { q: t('instances.qaInstance.2.q'), a: t('instances.qaInstance.2.a') },
+            { q: t('instances.qaInstance.3.q'), a: t('instances.qaInstance.3.a') },
+            { q: t('instances.qaInstance.4.q'), a: t('instances.qaInstance.4.a') },
+            { q: t('instances.qaInstance.5.q'), a: t('instances.qaInstance.5.a') }
+          ]}
+        />
+      )}
+    </div>
+  )
+}
+
+export function Instances(props: InstancesProps): JSX.Element {
+  const { config } = useHarness()
+  const currentGroup = resolveCurrentGroup(config?.groups ?? [], config?.activeGroupId)
+  if (currentGroup.kind !== 'home') return <GroupInstancesView group={currentGroup} {...props} />
+  return <InstancesHome {...props} />
+}
