@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "DSH Cookie Bridge",
+  "short_name": "DSH Bridge",
+  "version": "1.1.0",
+  "description": "Local, one-way Chrome cookie sync for DSH Launcher with optional fixed-token auth.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "alarms",
+    "cookies",
+    "offscreen",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "DSH Cookie Bridge",
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:* http://127.0.0.1:*"
+  }
+}

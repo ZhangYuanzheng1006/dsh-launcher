@@ -1,0 +1,23 @@
+DSH Launcher — enhanced distribution
+Copyright 2026 ZhangYuanzheng1006
+
+New contributions and modifications in this distribution are licensed under
+the Apache License, Version 2.0. See LICENSE.
+
+This distribution is based on DSH-Launcher v3.1.4 by MarcoG-h and upstream
+contributors, including baihejiangnan.
+Upstream: https://github.com/MarcoG-h/DSH-Launcher
+The upstream work remains under the MIT License. Its attribution and MIT
+permission notice are preserved in licenses/MIT-upstream.txt.
+
+Changes in this distribution include isolated DSH runtime versions, lifecycle
+and configuration recovery fixes, web and desktop app management, groups and
+profiles, the Chrome Cookie Bridge, and release packaging/documentation.
+See CHANGELOG.md for the changes in each release.
+
+DeepSeek Harness is a separate project by its respective authors:
+https://github.com/deepseek-ai/deepseek-harness
+Third-party packages and Electron/Chromium retain their own license terms.
+The installer includes Electron's LICENSE.electron.txt and LICENSES.chromium.html.
+Application and browser names/icons identify third-party products and do not
+imply endorsement or transfer of trademark rights.
