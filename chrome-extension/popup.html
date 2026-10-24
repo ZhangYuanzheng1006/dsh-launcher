@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DSH Cookie Bridge</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="mark">DSH</div>
+      <div>
+        <h1>Cookie Bridge</h1>
+        <p class="sub">Chrome → DSH Launcher · 仅本机</p>
+      </div>
+    </header>
+
+    <div class="status" aria-live="polite">
+      <span id="statusDot" class="dot"></span>
+      <span id="statusLabel" class="status-label">正在读取状态…</span>
+      <span id="portLabel" class="port">:17321</span>
+    </div>
+    <p id="message" class="message"></p>
+
+    <div class="field">
+      <label for="token">Token（可留空 · 启动器免 Token 模式）</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="可留空" />
+    </div>
+
+    <div class="row">
+      <div class="field port-field">
+        <label for="port">端口</label>
+        <input id="port" type="number" min="1" max="65535" step="1" inputmode="numeric" />
+      </div>
+      <div class="field">
+        <label for="serverHint">连接地址</label>
+        <input id="serverHint" type="text" value="ws://127.0.0.1" readonly />
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="save" class="primary" type="button">保存并连接</button>
+      <button id="sync" type="button">立即同步</button>
+    </div>
+
+    <div class="meta">
+      <span id="lastSync">最近同步：—</span>
+      <span id="cookieCount">Cookie：—</span>
+    </div>
+    <footer>单向同步 · 不反向写 Chrome · 留空则不发送 Token</footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

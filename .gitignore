@@ -1,0 +1,46 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+out/
+dist/
+release/
+.dsh-build/
+coverage/
+*.tsbuildinfo
+
+# environment and secrets
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+secret.json
+*.key
+*.pem
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# signing material and private packaging overrides
+*.pfx
+*.p12
+electron-builder.env
+*.dmp
+qa-installers/
+reports/release-3.2.0/qa-state.json
